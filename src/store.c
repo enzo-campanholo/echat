@@ -201,17 +201,70 @@ static int object_fields(const Json *j, size_t n)
     return count == n;
 }
 
+static int base64_valid(const char *s)
+{
+    size_t n, i, padding;
+    unsigned char c;
+    n = strlen(s);
+    if (!n || n % 4)
+        return 0;
+    padding = s[n - 1] == '=' ? 1 : 0;
+    if (n > 1 && s[n - 2] == '=')
+        padding++;
+    for (i = 0; i < n - padding; i++) {
+        c = (unsigned char)s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '/'))
+            return 0;
+    }
+    for (; i < n; i++)
+        if (s[i] != '=')
+            return 0;
+    return 1;
+}
+
+static int images_valid(const Json *images)
+{
+    const Json *p;
+    const char *type, *data, *mime, *q;
+    if (!images || images->type != J_ARR)
+        return 0;
+    for (p = images->child; p; p = p->next) {
+        type = json_str(json_get(p, "type"));
+        data = json_str(json_get(p, "data"));
+        mime = json_str(json_get(p, "mimeType"));
+        if (!object_fields(p, 3) || !type || strcmp(type, "image") ||
+            !data || !base64_valid(data) || !mime ||
+            strncmp(mime, "image/", 6) || !mime[6] || !utf8_valid(mime))
+            return 0;
+        for (q = mime; *q; q++)
+            if ((unsigned char)*q <= 32 || (unsigned char)*q == 127)
+                return 0;
+    }
+    return 1;
+}
+
+static int message_fields(const Json *j)
+{
+    const Json *images;
+    images = json_get(j, "images");
+    return images ? object_fields(j, 6) && images_valid(images) :
+                    object_fields(j, 5);
+}
+
 static int add_message(Store *s, const char *path, off_t offset,
                        const Json *j, const char *filename)
 {
     unsigned long id, size;
     size_t n;
     const char *kind, *text, *date;
+    const Json *images;
     Message *m;
     kind = json_str(json_get(j, "kind"));
     text = json_str(json_get(j, "text"));
     date = json_str(json_get(j, "date"));
-    if (!object_fields(j, 5) || !json_ulong(json_get(j, "i"), &id) ||
+    images = json_get(j, "images");
+    if (!message_fields(j) || !json_ulong(json_get(j, "i"), &id) ||
         id != s->count || !kind_valid(kind) || !text || !utf8_valid(text) ||
         !json_ulong(json_get(j, "size"), &size) || size != strlen(text) ||
         !date_valid(date, filename) || s->count == ULONG_MAX)
@@ -229,6 +282,7 @@ static int add_message(Store *s, const char *path, off_t offset,
     m->size = (size_t)size;
     m->kind = xstrdup(kind);
     m->date = xstrdup(date);
+    m->has_images = images && images->child;
     s->count++;
     return 1;
 }
@@ -773,7 +827,8 @@ static int append_line(Store *s, const char *path, const Buf *b, off_t *offset)
     return 1;
 }
 
-static int append_one(Store *s, const char *kind, const char *text)
+static int append_one(Store *s, const char *kind, const char *text,
+                      const Json *images)
 {
     char date[21], day[17], *path;
     Buf b;
@@ -797,6 +852,10 @@ static int append_one(Store *s, const char *kind, const char *text)
     buf_ulong(&b, (unsigned long)strlen(text));
     buf_puts(&b, ",\"date\":");
     buf_json(&b, date);
+    if (images && images->child) {
+        buf_puts(&b, ",\"images\":");
+        json_dump(&b, images);
+    }
     buf_puts(&b, "}\n");
     result = append_line(s, path, &b, &offset);
     if (result) {
@@ -819,12 +878,21 @@ static int append_one(Store *s, const char *kind, const char *text)
 int store_append(Store *s, const char *kind, const char *text,
                  unsigned long *first, unsigned long *number)
 {
+    return store_append_images(s, kind, text, NULL, first, number);
+}
+
+int store_append_images(Store *s, const char *kind, const char *text,
+                        const Json *images, unsigned long *first,
+                        unsigned long *number)
+{
     char *owned, *part;
     size_t remaining, n;
     unsigned long before;
     int result;
     if (!kind_valid(kind) || !text || !utf8_valid(text))
         return fail(s, "invalid message kind or UTF-8 text", NULL);
+    if (images && !images_valid(images))
+        return fail(s, "invalid image attachments", NULL);
     if (s->lockfd < 0 || s->count == ULONG_MAX)
         return fail(s, "chat is closed or its id space is exhausted", NULL);
     before = s->count;
@@ -844,7 +912,8 @@ int store_append(Store *s, const char *kind, const char *text,
         part = xmalloc(n + 1);
         memcpy(part, text, n);
         part[n] = 0;
-        result = append_one(s, kind, part);
+        result = append_one(s, kind, part, images);
+        images = NULL;
         free(part);
         if (!result)
             break;
@@ -907,14 +976,15 @@ int store_build(Store *s, Ref r, const char *text)
     return result;
 }
 
-char *store_message(Store *s, unsigned long i)
+static Json *message_record(Store *s, unsigned long i)
 {
     FILE *f;
     Buf line;
     Json *j;
     const char *text, *kind, *date;
     unsigned long stored_id, size;
-    char *result;
+    Json *result;
+    const Json *images;
     if (i >= s->count) {
         fail(s, "message id does not exist", NULL);
         return NULL;
@@ -932,20 +1002,54 @@ char *store_message(Store *s, unsigned long i)
         text = json_str(json_get(j, "text"));
         kind = json_str(json_get(j, "kind"));
         date = json_str(json_get(j, "date"));
-        if (object_fields(j, 5) &&
+        images = json_get(j, "images");
+        if (message_fields(j) &&
             json_ulong(json_get(j, "i"), &stored_id) && stored_id == i &&
             json_ulong(json_get(j, "size"), &size) && size == s->messages[i].size &&
             kind && !strcmp(kind, s->messages[i].kind) &&
             date && !strcmp(date, s->messages[i].date) &&
-            text && strlen(text) == s->messages[i].size && utf8_valid(text))
-            result = xstrdup(text);
-        json_free(j);
+            text && strlen(text) == s->messages[i].size && utf8_valid(text) &&
+            s->messages[i].has_images == (images && images->child))
+            result = j;
+        else
+            json_free(j);
     }
     if (!result)
         fail(s, "indexed message is unreadable or changed", s->messages[i].path);
     buf_free(&line);
     fclose(f);
     return result;
+}
+
+char *store_message(Store *s, unsigned long i)
+{
+    Json *j;
+    char *text;
+    j = message_record(s, i);
+    if (!j)
+        return NULL;
+    text = xstrdup(json_str(json_get(j, "text")));
+    json_free(j);
+    return text;
+}
+
+char *store_images(Store *s, unsigned long i)
+{
+    Json *j;
+    Buf b;
+    if (i >= s->count) {
+        fail(s, "message id does not exist", NULL);
+        return NULL;
+    }
+    if (!s->messages[i].has_images)
+        return NULL;
+    j = message_record(s, i);
+    if (!j)
+        return NULL;
+    buf_init(&b);
+    json_dump(&b, json_get(j, "images"));
+    json_free(j);
+    return b.s;
 }
 
 const char *store_date(Store *s, unsigned long id)

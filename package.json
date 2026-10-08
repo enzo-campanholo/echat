@@ -1,0 +1,8 @@
+{
+  "name": "uniichat",
+  "version": "0.1.0",
+  "description": "An endless chat for pi, with a POSIX C89 memory engine",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["pi/unii.ts"] }
+}

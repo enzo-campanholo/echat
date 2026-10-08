@@ -131,7 +131,8 @@ static void utf8_and_clip(void)
     buf_puts(&b, "MISSING");
     for (i = 0; i < 15000; i++)
         buf_puts(&b, "\xc3\xa9");
-    tail_bytes = 15000 * 2;
+    head_bytes = 14987 * 4;
+    tail_bytes = 14987 * 2;
     clipped = clip_echo(b.s);
     assert(clipped && utf8_valid(clipped));
     assert(!memcmp(clipped, b.s, head_bytes));

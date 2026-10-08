@@ -3,5 +3,10 @@
 /tests/base_test
 /tests/store_test
 /tests/view_test
+/tests/engine_test
+/tests/fake_pi
+/tests/server_test
+/tests/pi_test
+/tests/pi_live_test
 /result
 /.unii/

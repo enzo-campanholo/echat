@@ -219,6 +219,120 @@ static void split_and_pages(void)
     free(dir);
 }
 
+static void durable_images(void)
+{
+    static const char *invalid[] = {
+        "{}", "null", "[{}]", "[{\"type\":\"text\",\"data\":\"AA==\",\"mimeType\":\"image/png\"}]",
+        "[{\"type\":\"image\",\"data\":\"AA==\"}]",
+        "[{\"type\":\"image\",\"data\":\"AA==\",\"mimeType\":\"text/plain\"}]",
+        "[{\"type\":\"image\",\"data\":\"A===\",\"mimeType\":\"image/png\"}]",
+        "[{\"type\":\"image\",\"data\":\"A?==\",\"mimeType\":\"image/png\"}]",
+        "[{\"type\":\"image\",\"data\":\"AAA\",\"mimeType\":\"image/png\"}]",
+        "[{\"type\":\"image\",\"data\":\"\",\"mimeType\":\"image/png\"}]",
+        "[{\"type\":\"image\",\"data\":\"AA==\",\"mimeType\":\"image/png\",\"extra\":1}]",
+        NULL
+    };
+    const char *image_json, *text;
+    char *dir, *message, *images, *path, *before, *after;
+    Json *j, *bad, *record;
+    Store s;
+    Buf long_text, joined, line;
+    FILE *f;
+    unsigned long first, count, i, size;
+    size_t k;
+    int rc;
+    dir = new_dir();
+    assert(store_open(&s, dir));
+    image_json = "[{\"type\":\"image\",\"data\":\"AA==\",\"mimeType\":\"image/png\"},"
+                 "{\"type\":\"image\",\"data\":\"AQID\",\"mimeType\":\"image/jpeg\"}]";
+    j = json_parse(image_json);
+    assert(j);
+    text = "before\n\xc3\xa9\"after";
+    assert(store_append_images(&s, "user", text, j, &first, &count));
+    assert(first == 0 && count == 1 && s.messages[0].has_images);
+    assert(s.messages[0].size == strlen(text));
+    message = store_message(&s, 0);
+    assert(message && !strcmp(message, text));
+    free(message);
+    images = store_images(&s, 0);
+    assert(images && !strcmp(images, image_json));
+    free(images);
+    path = xstrdup(s.messages[0].path);
+    before = read_file(path);
+    assert(before);
+    for (k = 0; invalid[k]; k++) {
+        bad = json_parse(invalid[k]);
+        assert(bad);
+        assert(!store_append_images(&s, "user", "rejected", bad, NULL, NULL));
+        assert(s.count == 1);
+        json_free(bad);
+    }
+    after = read_file(path);
+    assert(after && !strcmp(before, after));
+    free(before);
+    free(after);
+    buf_init(&long_text);
+    buf_init(&joined);
+    buf_init(&line);
+    for (k = 0; k < 50000; k++)
+        buf_putc(&long_text, 'x');
+    assert(store_append_images(&s, "note", long_text.s, j, &first, &count));
+    assert(first == 1 && count == 2);
+    assert(s.messages[1].has_images && !s.messages[2].has_images);
+    assert(store_images(&s, 2) == NULL);
+    assert(store_append_images(&s, "echo", "", j, &first, &count));
+    assert(first == 3 && count == 1 && s.messages[3].has_images);
+    assert(s.messages[3].size == 0);
+    /* Every attachment is part of its complete, flushed message record. */
+    f = fopen(path, "rb");
+    assert(f);
+    i = 0;
+    while ((rc = read_line(f, &line)) == 1) {
+        record = json_parse(line.s);
+        assert(record);
+        assert(json_ulong(json_get(record, "size"), &size));
+        assert(size == s.messages[i].size);
+        assert((json_get(record, "images") != NULL) == (i != 2));
+        if (i == 0)
+            assert(!strcmp(json_str(json_get(record, "text")), text));
+        json_free(record);
+        i++;
+    }
+    assert(rc == 0 && i == 4 && fclose(f) == 0);
+    store_close(&s);
+    /* Recover a view saved before the attachment-bearing crash tail. */
+    put_file(dir, "view.json", "[[0,0]]\n");
+    assert(store_open(&s, dir));
+    assert(s.count == 4 && s.view.n == 4);
+    for (i = 0; i < 4; i++) {
+        assert(s.messages[i].has_images == (i != 2));
+        images = store_images(&s, i);
+        if (i == 2)
+            assert(!images);
+        else
+            assert(images && !strcmp(images, image_json));
+        free(images);
+    }
+    message = store_message(&s, 0);
+    assert(message && !strcmp(message, text));
+    free(message);
+    for (i = 1; i <= 2; i++) {
+        message = store_message(&s, i);
+        assert(message);
+        buf_puts(&joined, message);
+        free(message);
+    }
+    assert(!strcmp(joined.s, long_text.s));
+    json_free(j);
+    buf_free(&long_text);
+    buf_free(&joined);
+    buf_free(&line);
+    free(path);
+    store_close(&s);
+    remove_dir(dir);
+    free(dir);
+}
+
 static void crash_tail_and_state(void)
 {
     Store s;
@@ -322,6 +436,7 @@ int main(void)
 {
     restart_and_lock();
     split_and_pages();
+    durable_images();
     crash_tail_and_state();
     corrupt_files();
     puts("store: ok");

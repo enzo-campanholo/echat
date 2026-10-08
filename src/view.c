@@ -16,6 +16,10 @@ void view_free(View *v)
 void view_add(View *v, Ref r)
 {
     if (v->n == v->cap) {
+        if (v->cap > (size_t)-1 / sizeof(*v->v) / 2) {
+            fputs("unii: view is too large\n", stderr);
+            exit(1);
+        }
         v->cap = v->cap ? v->cap * 2 : 32;
         if (v->cap > (size_t)-1 / sizeof(*v->v)) {
             fputs("unii: view is too large\n", stderr);

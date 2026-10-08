@@ -22,7 +22,7 @@ char *read_file(const char *path);
 int write_all(int fd, const void *data, size_t n);
 size_t utf8_prefix(const char *s, size_t n); /* complete codepoints in first n bytes */
 int utf8_valid(const char *s);
-char *clip_echo(const char *s); /* 15,000 codepoints at each end */
+char *clip_echo(const char *s); /* head + marker + tail: 30,000 codepoints total */
 char *path_join(const char *a, const char *b);
 int mkdirs(const char *path);
 

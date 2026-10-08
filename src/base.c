@@ -309,10 +309,13 @@ int utf8_valid(const char *s)
 
 char *clip_echo(const char *s)
 {
+    static const char marker[] = "\n[... output clipped ...]\n";
     const char *p, *head, *tail;
-    size_t width, count, skip;
+    size_t width, count, skip, head_count, tail_count;
     Buf b;
     count = 0;
+    head_count = (ECHO_HALF * 2 - (sizeof(marker) - 1)) / 2;
+    tail_count = ECHO_HALF * 2 - (sizeof(marker) - 1) - head_count;
     head = s;
     for (p = s; *p; p += width) {
         width = utf8_char(p, 4, NULL);
@@ -321,12 +324,12 @@ char *clip_echo(const char *s)
             return NULL;
         }
         count++;
-        if (count == ECHO_HALF)
+        if (count == head_count)
             head = p + width;
     }
     if (count <= ECHO_HALF * 2)
         return xstrdup(s);
-    skip = count - ECHO_HALF;
+    skip = count - tail_count;
     tail = s;
     while (skip--) {
         width = utf8_char(tail, 4, NULL);
@@ -334,7 +337,7 @@ char *clip_echo(const char *s)
     }
     buf_init(&b);
     buf_add(&b, s, (size_t)(head - s));
-    buf_puts(&b, "\n[... output clipped ...]\n");
+    buf_puts(&b, marker);
     buf_puts(&b, tail);
     return b.s;
 }

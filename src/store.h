@@ -16,6 +16,7 @@ typedef struct Message {
     size_t size;
     char *kind;
     char *date;
+    int has_images;
 } Message;
 typedef struct Node { char *text; size_t size; int queued; int busy; } Node;
 typedef struct View { Ref *v; size_t n, cap, bytes; int shrinking; } View;
@@ -43,7 +44,13 @@ void store_close(Store *s);
 int store_save_view(Store *s);
 int store_append(Store *s, const char *kind, const char *text,
                  unsigned long *first, unsigned long *number);
+/* Images are pi blocks {type:"image",data:base64,mimeType:"image/..."}.
+ * Text and images share one durable record; only the first split has images. */
+int store_append_images(Store *s, const char *kind, const char *text,
+                        const Json *images, unsigned long *first,
+                        unsigned long *number);
 char *store_message(Store *s, unsigned long i);
+char *store_images(Store *s, unsigned long i); /* allocated JSON array, NULL if none/error */
 Node *store_node(Store *s, Ref r); /* NULL if nonexistent or unbuilt */
 Node *store_slot(Store *s, Ref r); /* allocate slot */
 int store_build(Store *s, Ref r, const char *text); /* append once, fsync */
