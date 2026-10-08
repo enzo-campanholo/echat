@@ -1,0 +1,7 @@
+/unii
+/src/*.o
+/tests/base_test
+/tests/store_test
+/tests/view_test
+/result
+/.unii/
