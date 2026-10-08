@@ -437,7 +437,7 @@ static int drain(Pi *p, int *fd, Buf *b, int is_bridge,
                 used = (size_t)(lf - b->s) + 1;
                 *lf = 0;
                 if (lf > b->s && lf[-1] == '\r') lf[-1] = 0;
-                j = json_parse(b->s);
+                j = memchr(b->s, 0, used - 1) ? NULL : json_parse(b->s);
                 if (!j) fail(p, "Pi sent invalid JSON");
                 else {
                     if (is_bridge) bridge(p, j, cb);

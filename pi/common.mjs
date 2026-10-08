@@ -38,8 +38,9 @@ export function registerMemory(pi, memory) {
 /* Split only LF, never Unicode paragraph separators. Keep byte prefixes stable. */
 export function chatBlocks(text) {
   if (!text.startsWith("<chat>\n")) return [{ type: "text", text }];
-  const end = text.indexOf("</chat>", 7);
-  if (end < 0) return [{ type: "text", text }];
+  const boundary = text.indexOf("\n</chat>\n", 6);
+  if (boundary < 0) return [{ type: "text", text }];
+  const end = boundary + 1;
   const lines = text.slice(7, end).split("\n");
   if (lines.at(-1) === "") lines.pop();
   const blocks = [];
@@ -83,18 +84,18 @@ export function cachePayload(payload, providerTools) {
   for (let mi = 0; mi < payload.messages.length; mi++) {
     const message = payload.messages[mi];
     if (!Array.isArray(message.content)) continue;
-    let inChat = false;
+    let inChat = false, foundChat = false;
     for (let bi = 0; bi < message.content.length; bi++) {
       const block = message.content[bi];
       if (block.type !== "text") continue;
-      if (block.text.startsWith("<chat>\n")) inChat = true;
-      if (inChat && block.text.includes("</chat>")) inChat = false;
+      if (block.text.startsWith("<chat>\n")) inChat = foundChat = true;
+      if (inChat && /(^|\n)<\/chat>\n/.test(block.text)) break;
       else if (inChat) {
         mark = block;
         prefix = [mi, bi];
       }
     }
-    if (mark) break;
+    if (foundChat) break;
   }
   if (mark) mark.cache_control = { type: "ephemeral" };
   const last = payload.messages.at(-1);
