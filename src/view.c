@@ -78,10 +78,25 @@ char *view_render(Store *s, View *v, unsigned long end, int built_only)
 
 size_t view_measure(Store *s, View *v)
 {
-    char *p;
-    p = view_render(s, v, s->count, 0);
-    v->bytes = strlen(p);
-    free(p);
+    size_t k, size, bytes;
+    unsigned long id, n;
+    Node *node;
+    bytes = 15; /* <chat>\n and </chat>\n */
+    for (k = 0; k < v->n; k++) {
+        node = store_node(s, v->v[k]);
+        size = node ? node->size : sizeof("(not summarized yet: zoom it)") - 1;
+        size += 3; /* +, |, LF */
+        id = ref_start(v->v[k]);
+        n = ref_span(v->v[k]);
+        do { size++; id /= 10; } while (id);
+        do { size++; n /= 10; } while (n);
+        if (size > (size_t)-1 - bytes) {
+            fputs("unii: view size overflow\n", stderr);
+            exit(1);
+        }
+        bytes += size;
+    }
+    v->bytes = bytes;
     return v->bytes;
 }
 

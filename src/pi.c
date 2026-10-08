@@ -100,6 +100,9 @@ int pi_start(Pi *p, const PiConfig *c)
     argv[n++] = "--no-extensions";
     argv[n++] = "--no-skills";
     argv[n++] = "--no-prompt-templates";
+    argv[n++] = "--no-mcp";
+    argv[n++] = "--no-context-files";
+    argv[n++] = "--offline";
     argv[n++] = "--no-approve";
     argv[n++] = "--extension"; argv[n++] = (char *)c->extension;
     argv[n++] = "--tools";

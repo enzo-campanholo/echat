@@ -125,6 +125,7 @@ static void sawtooth(void)
         }
         free(old);
         old = view_render(&s, &s.view, s.count, 0);
+        assert(s.view.bytes == strlen(old));
     }
     assert(batches > 10);
     free(old);
