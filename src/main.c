@@ -31,6 +31,7 @@ typedef struct Server {
     Json *cache_wait;
     int frontend_writing;
     Json *pending;
+    View preceding;
     unsigned long before;
     unsigned long configuration;
     int quitting, fatal;
@@ -180,7 +181,7 @@ static void cache_settle(Server *s)
 static int settle_pending(Server *s)
 {
     Json *req;
-    const char *op, *text;
+    const char *op;
     char *view;
     if (!s->pending)
         return 0;
@@ -190,9 +191,12 @@ static int settle_pending(Server *s)
         if (!running(s) && s->engine.failed.n != s->engine.failed.head) {
             /* Do not call a turn on incomplete memory. The next input is an
              * explicit retry opportunity, not a fabricated successful turn. */
-            error_response(req, "compaction failed; send your message again to retry");
+            error_response(req, !strcmp(op, "turn") ?
+                "compaction failed; input is saved; send a message to retry" :
+                "compaction failed; send a message to retry");
             json_free(req);
             s->pending = NULL;
+            view_free(&s->preceding);
         }
         return 0;
     }
@@ -210,18 +214,13 @@ static int settle_pending(Server *s)
     if (!strcmp(op, "flush")) {
         response(req, 1, NULL, NULL);
     } else {
-        view = view_render(&s->store, &s->store.view, s->before, 1);
-        text = json_str(json_get(req, "text"));
-        /* Capture first, append second. The new user message follows the view. */
-        if (append(s, "user", text, json_get(req, "images")) < 0) {
-            free(view);
-            return -1;
-        }
+        view = view_render(&s->store, &s->preceding, s->before, 1);
         response(req, 1, "view", view);
         free(view);
     }
     json_free(req);
     s->pending = NULL;
+    view_free(&s->preceding);
     return 0;
 }
 
@@ -282,8 +281,20 @@ static int dispatch(Server *s, Json *req)
         } else {
             /* Failed calls retry only at an incoming message. No timed retry. */
             engine_retry(&s->engine);
-            s->pending = req;
             s->before = s->store.count;
+            /* Capture the preceding view before recording input. Its missing
+             * nodes may finish later; its boundary must never move. */
+            if (!strcmp(op, "turn")) {
+                view_copy(&s->preceding, &s->store.view);
+                if (append(s, "user", text, json_get(req, "images")) < 0) {
+                    error_response(req, s->store.error);
+                    s->fatal = 1;
+                    view_free(&s->preceding);
+                    json_free(req);
+                    return -1;
+                }
+            }
+            s->pending = req;
             return settle_pending(s);
         }
     } else if (!strcmp(op, "cache_wait")) {
@@ -374,6 +385,9 @@ static int consume(Server *s)
         if (!req || req->type != J_OBJ) {
             error_response(NULL, "invalid JSON request");
             json_free(req);
+            /* An unparsed request has no trustworthy correlation id. Closing
+             * the channel rejects every waiter instead of stranding one. */
+            return -1;
         } else if (dispatch(s, req) < 0)
             return -1;
     }
@@ -561,6 +575,7 @@ static int serve(Server *s)
         free(s->workers[k].shortest);
     }
     json_free(s->pending);
+    view_free(&s->preceding);
     json_free(s->cache_wait);
     buf_free(&s->input);
     free(s->system);

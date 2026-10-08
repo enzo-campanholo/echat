@@ -49,6 +49,22 @@ export default function (pi: any) {
   let turnState = "", anchor: number | undefined;
   let tools: any[] = [], providerTools: any[] | undefined;
   let shuttingDown = false;
+  let failure: Error | undefined;
+
+  const stop = (error: any, context = ctx) => {
+    failure = error instanceof Error ? error : new Error(String(error));
+    context?.abort();
+    if (context?.hasUI) context.ui.notify("UniiChat stopped: " + failure.message, "error");
+    else console.error("UniiChat stopped: " + failure.message);
+  };
+  /* Pi reports thrown event handlers and continues. Abort explicitly whenever
+   * the memory boundary fails, including before executing a tool batch. */
+  const guard = (handler: any) => async (event: any, context: any) => {
+    ctx = context;
+    if (failure) { context.abort(); return; }
+    try { return await handler(event, context); }
+    catch (error) { stop(error, context); }
+  };
 
   const request = (op: string, data: any = {}) => {
     if (!backend) return Promise.reject(new Error("UniiChat backend is not running"));
@@ -92,7 +108,7 @@ export default function (pi: any) {
     });
     backend = new Records(child.stdout, child.stdin, (event: any) => {
       if (event.event === "error" && ctx?.hasUI) ctx.ui.notify(event.text, "error");
-    });
+    }, (error: Error) => { if (!shuttingDown) stop(error); });
     child.on("error", (error: Error) => backend.fail(error));
     child.on("exit", (code: number, signal: string) => {
       backend.fail(new Error("UniiChat backend exited (" + (signal || code) + ")"));
@@ -107,14 +123,15 @@ export default function (pi: any) {
     if (shuttingDown) {
       startup = undefined; backend = undefined; configured = "";
       providerTools = undefined; shuttingDown = false; running = false;
+      failure = undefined;
     }
-    if (!startup) startup = launch();
+    if (!startup) startup = launch().catch(stop);
     await startup;
   });
   pi.on("session_shutdown", async () => {
     shuttingDown = true;
     try {
-      if (backend && !backend.closed) await request("shutdown");
+      if (backend && !backend.closed) await request("shutdown").catch(() => {});
     } finally {
       child?.stdin.end();
       await exited;
@@ -124,26 +141,35 @@ export default function (pi: any) {
   pi.on("session_before_compact", () => ({ cancel: true }));
 
   registerMemory(pi, async (name: string, args: any) => await request(name, { args }));
+  pi.on("tool_call", () => failure ? { block: true, reason: failure.message, terminate: true } : undefined);
   pi.on("input", async (event: any, context: any) => {
     ctx = context;
     await startup;
-    if (running || !context.isIdle()) {
-      await request("steer", { text: event.text, images: event.images });
-    } else {
-      await configure();
-      const response = await request("turn", { text: event.text, images: event.images });
-      view = response.view;
-      if (response.system) system = response.system;
-      fresh = true;
-      cut = -1;
-      anchor = undefined;
-      turnState = "Current date: " + new Date().toISOString() + "\nWorking directory: " + context.cwd + "\n\n";
-      running = true;
+    if (!backend || backend.closed) return { action: "handled" };
+    try {
+      if (running || !context.isIdle()) {
+        if (failure) return { action: "handled" };
+        await request("steer", { text: event.text, images: event.images });
+      } else {
+        failure = undefined;
+        await configure();
+        const response = await request("turn", { text: event.text, images: event.images });
+        view = response.view;
+        if (response.system) system = response.system;
+        fresh = true;
+        cut = -1;
+        anchor = undefined;
+        turnState = "Current date: " + new Date().toISOString() + "\nWorking directory: " + context.cwd + "\n\n";
+        running = true;
+      }
+      return { action: "continue" };
+    } catch (error) {
+      stop(error, context);
+      return { action: "handled" };
     }
-    return { action: "continue" };
   });
-  pi.on("before_agent_start", () => ({ systemPrompt: system }));
-  pi.on("context_with_system", (event: any) => {
+  pi.on("before_agent_start", guard(() => ({ systemPrompt: system })));
+  pi.on("context_with_system", guard((event: any) => {
     const conversation = event.messages.filter((message: any) => message.role !== "system");
     if (fresh) {
       cut = conversation.map((message: any) => message.role).lastIndexOf("user");
@@ -159,19 +185,19 @@ export default function (pi: any) {
     const content = typeof first.content === "string" ? [{ type: "text", text: first.content }] : first.content;
     current[0] = { ...first, content: [...chatBlocks(view + "\n\n"), { type: "text", text: turnState }, ...content] };
     return { messages: stableContext(current, system, tools) };
-  });
-  pi.on("before_provider_request", async (event: any) => {
+  }));
+  pi.on("before_provider_request", guard(async (event: any) => {
     const { payload, key } = cachePayload(event.payload);
     if (Array.isArray(payload?.system) && Array.isArray(payload?.tools)) await configure(payload.tools);
     lastPrefix = key;
     if (key) await request("cache_wait", { key });
     return payload;
-  });
-  pi.on("after_provider_response", async () => {
+  }));
+  pi.on("after_provider_response", guard(async () => {
     if (lastPrefix) await request("cache_started", { key: lastPrefix });
     lastPrefix = undefined;
-  });
-  pi.on("message_end", async (event: any) => {
+  }));
+  pi.on("message_end", guard(async (event: any) => {
     const message = event.message;
     if (message.role === "assistant") {
       for (const block of message.content) {
@@ -182,7 +208,7 @@ export default function (pi: any) {
       await request("append", { kind: "echo", text: textContent(message.content),
         images: message.content.filter((block: any) => block.type === "image") });
     }
-  });
+  }));
   pi.on("tool_result", (event: any) => {
     const text = textContent(event.content);
     const clipped = clip(text);
@@ -190,16 +216,16 @@ export default function (pi: any) {
     const content = [{ type: "text", text: clipped }, ...event.content.filter((block: any) => block.type !== "text")];
     return { content, structuredContent: event.structuredContent };
   });
-  pi.on("tool_execution_start", async (event: any) => {
+  pi.on("tool_execution_start", guard(async (event: any) => {
     if (event.parentToolCallId) await request("append", { kind: "tool", text: event.toolName + " " + JSON.stringify(event.args) });
-  });
-  pi.on("tool_execution_end", async (event: any) => {
+  }));
+  pi.on("tool_execution_end", guard(async (event: any) => {
     if (event.parentToolCallId) await request("append", { kind: "echo", text: textContent(event.result?.content),
       images: event.result?.content?.filter((block: any) => block.type === "image") });
-  });
+  }));
   pi.on("agent_settled", async () => {
     running = false;
-    if (lastPrefix) await request("cache_started", { key: lastPrefix });
+    if (lastPrefix && !failure) await request("cache_started", { key: lastPrefix }).catch(stop);
     lastPrefix = undefined;
   });
 

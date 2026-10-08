@@ -29,11 +29,10 @@ static Client start(const char *dir)
     return c;
 }
 
-static Json *request(Client *c, const char *op, const char *kind, const char *text)
+static void send(Client *c, const char *op, const char *kind, const char *text)
 {
-    Buf b, input;
-    Json *response;
-    buf_init(&b); buf_init(&input);
+    Buf b;
+    buf_init(&b);
     buf_puts(&b, "{\"id\":"); buf_ulong(&b, ++c->serial);
     buf_puts(&b, ",\"op\":"); buf_json(&b, op);
     if (kind) { buf_puts(&b, ",\"kind\":"); buf_json(&b, kind); }
@@ -42,12 +41,27 @@ static Json *request(Client *c, const char *op, const char *kind, const char *te
         buf_json(&b, text);
     }
     buf_puts(&b, "}\n");
-    fputs(b.s, c->out); assert(!fflush(c->out));
+    fputs(b.s, c->out);
+    buf_free(&b);
+}
+
+static Json *receive(Client *c)
+{
+    Buf input;
+    Json *response;
+    buf_init(&input);
     assert(read_line(c->in, &input) == 1);
     response = json_parse(input.s);
     assert(response);
-    buf_free(&b); buf_free(&input);
+    buf_free(&input);
     return response;
+}
+
+static Json *request(Client *c, const char *op, const char *kind, const char *text)
+{
+    send(c, op, kind, text);
+    assert(!fflush(c->out));
+    return receive(c);
 }
 
 static void ok(Json *j)
@@ -68,6 +82,62 @@ static void stop(Client *c)
     fclose(c->out); fclose(c->in);
     assert(waitpid(c->pid, &status, 0) == c->pid);
     assert(WIFEXITED(status) && !WEXITSTATUS(status));
+}
+
+static void failed_input(const char *root, const char *text)
+{
+    Client c;
+    char *dir, *marker;
+    Json *j;
+    unsigned long count;
+    const char *view;
+    dir = path_join(root, "failed-input");
+    marker = path_join(root, "fail-once");
+    assert(!setenv("UNII_TEST_FAIL_ONCE", marker, 1));
+    c = start(dir);
+    assert(!unsetenv("UNII_TEST_FAIL_ONCE"));
+    ok(request(&c, "append", "note", text));
+    /* Dispatch both before the workers run, making the failure deterministic. */
+    send(&c, "configure", NULL, "fixed system");
+    send(&c, "turn", NULL, "INPUT_SAVED_DESPITE_SUMMARY_FAILURE");
+    assert(!fflush(c.out));
+    ok(receive(&c));
+    j = receive(&c);
+    assert(json_str(json_get(j, "error")));
+    json_free(j);
+    j = request(&c, "status", NULL, NULL);
+    assert(json_ulong(json_get(j, "messages"), &count) && count == 2);
+    ok(j);
+    j = request(&c, "turn", NULL, "retry after failure");
+    view = json_str(json_get(j, "view"));
+    assert(view && strstr(view, "INPUT_SAVED_DESPITE_SUMMARY_FAILURE"));
+    assert(!strstr(view, "retry after failure") && !strstr(view, "not summarized yet"));
+    ok(j);
+    stop(&c);
+    free(dir); free(marker);
+}
+
+static void invalid_protocol(const char *root)
+{
+    Client c;
+    char *dir;
+    Json *j;
+    Buf input;
+    int status;
+    dir = path_join(root, "invalid-protocol");
+    c = start(dir);
+    fputs("{\"id\":42,\"op\":\"append\",\"kind\":\"user\",\"text\":\"a\\u0000b\"}\n", c.out);
+    assert(!fflush(c.out));
+    j = receive(&c);
+    assert(json_str(json_get(j, "error")));
+    json_free(j);
+    buf_init(&input);
+    assert(read_line(c.in, &input) == 0);
+    buf_free(&input);
+    fclose(c.in); fclose(c.out);
+    assert(waitpid(c.pid, &status, 0) == c.pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    free(dir);
 }
 
 int main(int argc, char **argv)
@@ -109,6 +179,8 @@ int main(int argc, char **argv)
     before = read_file(path);
     assert(before);
     stop(&c);
+    failed_input(argv[1], text);
+    invalid_protocol(argv[1]);
     c = start(argv[1]);
     ok(request(&c, "configure", NULL, "fixed system"));
     after = read_file(path);

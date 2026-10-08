@@ -111,12 +111,13 @@ export function cachePayload(payload, providerTools) {
 
 /* Strict JSONL transport shared by the inherited socket and the C daemon. */
 export class Records {
-  constructor(input, output, notify = () => {}) {
+  constructor(input, output, notify = () => {}, onFailure = () => {}) {
     this.output = output;
     this.pending = new Map();
     this.serial = 0;
     this.buffer = Buffer.alloc(0);
     this.closed = false;
+    this.onFailure = onFailure;
     input.on("data", chunk => {
       this.buffer = Buffer.concat([this.buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
       let end;
@@ -125,6 +126,10 @@ export class Records {
         this.buffer = this.buffer.subarray(end + 1);
         try {
           const record = JSON.parse(bytes.toString("utf8"));
+          if ((record.ok === false || record.error) && record.id == null) {
+            this.fail(new Error(record.error || "UniiChat protocol error"));
+            return;
+          }
           const waiter = this.pending.get(String(record.id));
           if (waiter) {
             this.pending.delete(String(record.id));
@@ -139,9 +144,11 @@ export class Records {
     output.on("error", error => this.fail(error));
   }
   fail(error) {
+    if (this.closed) return;
     this.closed = true;
     for (const waiter of this.pending.values()) waiter.reject(error);
     this.pending.clear();
+    this.onFailure(error);
   }
   request(data) {
     if (this.closed) return Promise.reject(new Error("UniiChat backend unavailable"));

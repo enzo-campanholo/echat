@@ -87,7 +87,9 @@ printf 'Personal instructions or earlier memories.\n' | ./unii add CHAT note
 Imports build short nodes without a model. Long imports are summarized when
 the extension starts. A failed model call stays queued for the next message;
 a fresh turn waits for all earlier message summaries and reports a failure
-instead of proceeding with partial memory.
+instead of proceeding with partial memory. Its incoming words are already
+saved, and the next message retries failed work. Backend and persistence
+failures stop the turn and block subsequent tools.
 
 ## Storage and scheduling
 
@@ -113,6 +115,8 @@ Non-tool text splits at UTF-8 boundaries into consecutive messages of at most
 budget; multibyte echoes can span several retrieval pages. Message text is
 indexed by file offsets rather than kept in memory. Node summaries are kept
 in memory; their storage grows with the chat.
+Text must be valid UTF-8 without NUL bytes. Invalid JSON requests close the
+backend protocol connection so callers cannot wait indefinitely.
 
 Attached images are stored with the original text in the same durable log
 record. Only the first chunk of a split message carries them. Image-bearing
@@ -161,6 +165,7 @@ C-daemon turns with eight concurrent deterministic pi RPC peers.
 
 The optional `make test-pi` uses an installed pi with a deterministic test
 provider to exercise the actual extension hooks and memory tools without
-API keys or provider requests. It also checks shared worker/turn prompts and
-tool definitions. See [pi's extension API](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)
+API keys or network requests. It also checks shared worker/turn prompts and
+tool definitions, reused worker sessions, cache barriers, and failure paths.
+See [pi's extension API](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)
 and [RPC protocol](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md).

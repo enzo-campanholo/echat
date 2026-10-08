@@ -54,8 +54,16 @@ test: all tests/base_test tests/store_test tests/view_test tests/fake_pi tests/s
 tests/pi_live_test: tests/pi_live_test.c src/base.o src/store.o src/view.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/pi_live_test.c src/base.o src/store.o src/view.o
 
-test-pi: all tests/fake_pi tests/pi_live_test
+tests/pi_worker_test: tests/pi_worker_test.c src/base.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/pi_worker_test.c src/base.o
+
+tests/pi_failure_test: tests/pi_failure_test.c src/base.o src/store.o src/view.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/pi_failure_test.c src/base.o src/store.o src/view.o
+
+test-pi: all tests/fake_pi tests/pi_live_test tests/pi_worker_test tests/pi_failure_test
 	sh tests/pi_live.sh
+	sh tests/pi_worker.sh
+	sh tests/pi_failure.sh
 
 install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/unii/pi
@@ -63,4 +71,4 @@ install: all
 	cp pi/*.mjs pi/*.ts pi/prompt.txt $(DESTDIR)$(PREFIX)/share/unii/pi/
 
 clean:
-	rm -f unii src/*.o tests/base_test tests/store_test tests/view_test tests/fake_pi tests/server_test tests/engine_test tests/pi_test tests/pi_live_test
+	rm -f unii src/*.o tests/base_test tests/store_test tests/view_test tests/fake_pi tests/server_test tests/engine_test tests/pi_test tests/pi_live_test tests/pi_worker_test tests/pi_failure_test
