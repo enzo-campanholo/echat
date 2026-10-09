@@ -278,7 +278,7 @@ static void check_coverage(const char *view, unsigned long total)
 static void backlog(const char *root, const char *source, int fail_merges)
 {
     Client c;
-    char *dir, *marker;
+    char *dir, *marker, short_source[501];
     const char *view;
     Json *j;
     FILE *f;
@@ -287,6 +287,10 @@ static void backlog(const char *root, const char *source, int fail_merges)
     dir = path_join(root, fail_merges ? "failed-backlog" : "backlog");
     marker = path_join(root, "fail-merges");
     if (fail_merges) {
+        /* Verbatim leaves can all build even while every parent fails. */
+        memcpy(short_source, source, 500);
+        short_source[500] = 0;
+        source = short_source;
         f = fopen(marker, "w");
         assert(f && !fclose(f));
         assert(!setenv("UNII_TEST_FAIL_MERGES", marker, 1));
@@ -309,6 +313,7 @@ static void backlog(const char *root, const char *source, int fail_merges)
         assert(json_ulong(json_get(j, "messages"), &count) && count == 501);
         assert(json_ulong(json_get(j, "summarized"), &count) && count == 501);
         assert(json_ulong(json_get(j, "failed"), &count) && count > 0);
+        assert(json_ulong(json_get(j, "blocked"), &count) && count > 0);
         ok(j);
         /* Only a new message may retry the failed parents. Once the fault
          * clears, the saved input is covered by a bounded preceding view. */

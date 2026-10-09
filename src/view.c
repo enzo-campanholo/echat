@@ -57,7 +57,8 @@ static void line(Buf *b, Ref r, const Node *n)
 
 /* Open only the node crossing the cutoff. Its children already exist; this
  * preserves the saved view's merges and never exposes a later message. */
-static int prefix_line(Store *s, Buf *b, Ref r, unsigned long end, int built_only)
+static int prefix_line(Store *s, Buf *b, Ref r, unsigned long end, int built_only,
+                       size_t limit)
 {
     Node *n;
     Ref child;
@@ -68,27 +69,39 @@ static int prefix_line(Store *s, Buf *b, Ref r, unsigned long end, int built_onl
     if (ref_span(r) > end - start) {
         child.l = r.l - 1;
         child.i = r.i * 2;
-        if (!prefix_line(s, b, child, end, built_only))
+        if (!prefix_line(s, b, child, end, built_only, limit))
             return 0;
         child.i++;
-        return prefix_line(s, b, child, end, built_only);
+        return prefix_line(s, b, child, end, built_only, limit);
     }
     n = store_node(s, r);
     if (!n && built_only)
         return 0;
     line(b, r, n);
-    return 1;
+    return !limit || b->len <= limit - 8; /* reserve </chat>\n */
 }
 
 char *view_render(Store *s, View *v, unsigned long end, int built_only)
 {
+    return view_render_limit(s, v, end, built_only, 0);
+}
+
+char *view_render_limit(Store *s, View *v, unsigned long end, int built_only,
+                       size_t limit)
+{
     Buf b;
     size_t i;
+    if (limit && limit < 15)
+        return NULL;
     buf_init(&b);
     buf_puts(&b, "<chat>\n");
     for (i = 0; i < v->n; i++) {
-        if (!prefix_line(s, &b, v->v[i], end, built_only))
+        if (!prefix_line(s, &b, v->v[i], end, built_only, limit))
             break;
+    }
+    if (limit && b.len > limit - 8) {
+        buf_free(&b);
+        return NULL;
     }
     buf_puts(&b, "</chat>\n");
     return b.s;

@@ -13,10 +13,11 @@ typedef struct Job { Ref ref; unsigned long retry; } Job;
 typedef struct Queue { Job *v; size_t head, n, cap; } Queue;
 typedef struct Engine {
     Store *store;
-    Queue ready, leaves, failed;
+    Queue ready, leaves, failed, deferred;
     View compact;
     unsigned long seen, contiguous;
     unsigned int inflight;
+    int deferred_ready;
 } Engine;
 
 int engine_open(Engine *e, Store *s);
@@ -27,7 +28,7 @@ int engine_done(Engine *e, Job j, const char *text);
 void engine_fail(Engine *e, Job j);
 void engine_retry(Engine *e); /* called once on a new incoming message */
 char *engine_task(Engine *e, Job j);
-char *engine_context(Engine *e, Job j);
+char *engine_context(Engine *e, Job j); /* NULL if complete prefix exceeds 32 KB */
 int engine_caught_up(Engine *e, unsigned long before);
 
 #endif

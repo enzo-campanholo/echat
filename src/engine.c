@@ -35,6 +35,69 @@ static int dequeue(Queue *q, Job *j)
     return 1;
 }
 
+static unsigned long context_end(Job j)
+{
+    return ref_start(j.ref) + (j.ref.l ? ref_span(j.ref) : 0);
+}
+
+/* Oversized jobs wait in a min-heap by their context's end. A built ancestor
+ * cannot cross an unbuilt job, so these prefixes increase with the cutoff.
+ * Only a view merge can make the smallest blocked prefix fit. */
+static void defer(Engine *e, Job j)
+{
+    Queue *q;
+    Node *n;
+    size_t i, parent;
+    q = &e->deferred;
+    n = store_slot(e->store, j.ref);
+    n->busy = 0;
+    n->queued = 3;
+    j.retry = 1; /* a deferred leaf is already counted in inflight */
+    enqueue(q, j);
+    i = q->n - 1;
+    while (i) {
+        parent = (i - 1) / 2;
+        if (context_end(q->v[parent]) <= context_end(j))
+            break;
+        q->v[i] = q->v[parent];
+        i = parent;
+    }
+    q->v[i] = j;
+}
+
+static int take_deferred(Engine *e, Job *j)
+{
+    Queue *q;
+    Job last;
+    char *view;
+    size_t i, child;
+    q = &e->deferred;
+    if (!e->deferred_ready || !q->n)
+        return 0;
+    view = engine_context(e, q->v[0]);
+    if (!view) {
+        e->deferred_ready = 0;
+        return 0;
+    }
+    free(view);
+    *j = q->v[0];
+    last = q->v[--q->n];
+    i = 0;
+    while (i < q->n / 2) {
+        child = i * 2 + 1;
+        if (child + 1 < q->n &&
+            context_end(q->v[child + 1]) < context_end(q->v[child]))
+            child++;
+        if (context_end(last) <= context_end(q->v[child]))
+            break;
+        q->v[i] = q->v[child];
+        i = child;
+    }
+    if (q->n)
+        q->v[i] = last;
+    return 1;
+}
+
 static void ready(Engine *e, Ref r)
 {
     Node *n;
@@ -196,6 +259,7 @@ void engine_close(Engine *e)
     free(e->ready.v);
     free(e->leaves.v);
     free(e->failed.v);
+    free(e->deferred.v);
     view_free(&e->compact);
     memset(e, 0, sizeof(*e));
 }
@@ -221,6 +285,8 @@ static int update_views(Engine *e)
     }
     compact_pending = e->compact.shrinking;
     compact_changed = view_shrink(s, &e->compact, COMPACT_HIGH, COMPACT_LOW, 0);
+    if (changed || compact_changed)
+        e->deferred_ready = 1;
     if (old_generation != s->generation || changed || compact_changed ||
         compact_pending != e->compact.shrinking)
         return save_compact(e);
@@ -300,7 +366,7 @@ int engine_next(Engine *e, Job *j)
     Buf source;
     int have;
     for (;;) {
-        have = dequeue(&e->ready, j);
+        have = take_deferred(e, j) || dequeue(&e->ready, j);
         if (!have) {
             if (e->inflight >= WORKERS || !dequeue(&e->leaves, j))
                 return 0;
@@ -348,6 +414,12 @@ int engine_next(Engine *e, Job *j)
             continue;
         }
         buf_free(&source);
+        text = engine_context(e, *j);
+        if (!text) {
+            defer(e, *j);
+            continue;
+        }
+        free(text);
         return 1;
     }
 }
@@ -413,8 +485,8 @@ char *engine_task(Engine *e, Job j)
 char *engine_context(Engine *e, Job j)
 {
     unsigned long end;
-    end = ref_start(j.ref) + (j.ref.l ? ref_span(j.ref) : 0);
-    return view_render(e->store, &e->compact, end, 1);
+    end = context_end(j);
+    return view_render_limit(e->store, &e->compact, end, 1, COMPACT_HIGH);
 }
 
 int engine_caught_up(Engine *e, unsigned long before)

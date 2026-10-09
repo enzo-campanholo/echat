@@ -67,6 +67,9 @@ void view_copy(View *to, const View *from);
 size_t view_measure(Store *s, View *v);
 /* Render the saved view's prefix, opening a node which crosses end. */
 char *view_render(Store *s, View *v, unsigned long end, int built_only);
+/* NULL when the complete prefix would exceed limit; never return a cut view. */
+char *view_render_limit(Store *s, View *v, unsigned long end, int built_only,
+                       size_t limit);
 /* Most-due built sibling pair. Age is measured from the pair's last message.
  * max_lines != 0 selects a line budget (used to verify rollback equivalence).
  * Otherwise enforce sawtooth hi/lo bytes, retaining an unfinished batch. */

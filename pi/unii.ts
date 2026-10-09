@@ -47,6 +47,7 @@ export default function (pi: any) {
   let baseSystem = "", system = "", view = "", configured = "";
   let fresh = false, cut = -1, running = false, lastPrefix: string | undefined;
   let turnState = "", anchor: number | undefined;
+  let preparingInput: Promise<void> | undefined;
   let tools: any[] = [], providerTools: any[] | undefined;
   let shuttingDown = false;
   let failure: Error | undefined;
@@ -146,40 +147,56 @@ export default function (pi: any) {
     ctx = context;
     await startup;
     if (!backend || backend.closed) return { action: "handled" };
+    let preparing = false;
+    let releaseInput: (() => void) | undefined;
     try {
       if (running || !context.isIdle()) {
+        await preparingInput;
         if (failure) return { action: "handled" };
         await request("steer", { text: event.text, images: event.images });
       } else {
         failure = undefined;
-        await configure();
-        const response = await request("turn", { text: event.text, images: event.images });
-        view = response.view;
-        if (response.system) system = response.system;
+        preparing = true;
+        running = true;
         fresh = true;
         cut = -1;
         anchor = undefined;
+        preparingInput = new Promise(resolveInput => { releaseInput = resolveInput; });
+        await configure();
+        const turn = request("turn", { text: event.text, images: event.images });
+        /* Later input must follow the initiating record, while still reaching
+         * the backend during its wait for preceding summaries. */
+        releaseInput!();
+        preparingInput = undefined;
+        const response = await turn;
+        view = response.view;
+        if (response.system) system = response.system;
         turnState = "Current date: " + new Date().toISOString() + "\nWorking directory: " + context.cwd + "\n\n";
-        running = true;
       }
       return { action: "continue" };
     } catch (error) {
+      if (preparing) { running = false; fresh = false; cut = -1; anchor = undefined; }
       stop(error, context);
+      releaseInput?.();
+      if (preparing) preparingInput = undefined;
       return { action: "handled" };
     }
   });
+  pi.on("message_start", guard((event: any, context: any) => {
+    if (fresh && event.message.role === "user") {
+      /* Pi emits the initiating user before draining queued steering. Capture
+       * its position in the UI transcript before message_end persists it. */
+      cut = context.sessionManager.buildSessionContext().messages
+        .filter((message: any) => message.role !== "system").length;
+      anchor = event.message.timestamp;
+      fresh = false;
+    }
+  }));
   pi.on("before_agent_start", guard(() => ({ systemPrompt: system })));
   pi.on("context_with_system", guard((event: any) => {
     const conversation = event.messages.filter((message: any) => message.role !== "system");
-    if (fresh) {
-      cut = conversation.map((message: any) => message.role).lastIndexOf("user");
-      if (cut < 0) throw new Error("UniiChat turn has no user message");
-      anchor = conversation[cut].timestamp;
-      fresh = false;
-    } else {
-      cut = conversation.findIndex((message: any) => message.role === "user" && message.timestamp === anchor);
-    }
-    if (cut < 0) throw new Error("UniiChat received a model request before its input handler");
+    if (fresh || cut < 0 || conversation[cut]?.role !== "user" || conversation[cut]?.timestamp !== anchor)
+      throw new Error("UniiChat received a model request without its initiating user message");
     const current = conversation.slice(cut);
     const first = current[0];
     const content = typeof first.content === "string" ? [{ type: "text", text: first.content }] : first.content;

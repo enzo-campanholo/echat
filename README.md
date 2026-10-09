@@ -58,6 +58,9 @@ Use `--no-session` so pi does not write a second session file containing
 thoughts. UniiChat itself never logs thoughts. Each provider request starts
 with the saved view and only the current turn's messages; pi's UI can keep
 showing earlier turns.
+Messages arriving during memory preparation or a reply are logged as steering
+and remain in that turn. Its view stays at the boundary before the initiating
+message.
 
 ## Instructions and commands
 
@@ -139,6 +142,10 @@ parents enter queues; startup makes one linear pass and subsequent work
 never rescans the tree. A message starts with fewer than eight unbuilt
 predecessors. Context stops before the first missing node and never exposes
 part of a message.
+Jobs whose complete context would exceed 32,000 bytes wait for earlier parent
+merges. Blocked jobs are kept in a heap by their context cutoff, and become
+eligible as the saved compaction view shrinks. Failed calls remain separate
+and retry only after a new message.
 
 The turn view grows past 128,000 bytes, then merges toward 64,000. Only built
 parents are eligible. Pair priority uses age from the pair's **last** message,

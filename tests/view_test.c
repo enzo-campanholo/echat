@@ -162,7 +162,7 @@ static void cutoff(void)
 {
     Store s;
     Ref r;
-    char *text, *p, *end;
+    char *text, *bounded, *p, *end;
     unsigned long i, cut, id, n, covered;
     memset(&s, 0, sizeof(s));
     s.count = 16;
@@ -184,6 +184,10 @@ static void cutoff(void)
             assert(end);
         }
         assert(covered == cut && !strcmp(p, "</chat>\n"));
+        bounded = view_render_limit(&s, &s.view, cut, 1, strlen(text));
+        assert(bounded && !strcmp(text, bounded));
+        free(bounded);
+        assert(!view_render_limit(&s, &s.view, cut, 1, strlen(text) - 1));
         free(text);
     }
     assert(s.view.n == 1 && s.view.v[0].l == 4);

@@ -152,6 +152,8 @@ static void status(Server *s, const Json *req)
     buf_ulong(&b, (unsigned long)running(s));
     buf_puts(&b, ",\"failed\":");
     buf_ulong(&b, (unsigned long)(s->engine.failed.n - s->engine.failed.head));
+    buf_puts(&b, ",\"blocked\":");
+    buf_ulong(&b, (unsigned long)s->engine.deferred.n);
     buf_puts(&b, "}\n");
     if (write_all(STDOUT_FILENO, b.s, b.len) < 0)
         interrupted = 1;
@@ -195,12 +197,14 @@ static int settle_pending(Server *s)
     req = s->pending;
     op = json_str(json_get(req, "op"));
     if (!engine_caught_up(&s->engine, s->before)) {
-        if (!running(s) && s->engine.failed.n != s->engine.failed.head) {
+        if (!running(s) && (s->engine.failed.n != s->engine.failed.head ||
+            (s->engine.deferred.n && !s->engine.deferred_ready &&
+             s->engine.ready.head == s->engine.ready.n))) {
             /* Do not call a turn on incomplete memory. The next input is an
              * explicit retry opportunity, not a fabricated successful turn. */
             error_response(req, !strcmp(op, "turn") ?
-                "compaction failed; input is saved; send a message to retry" :
-                "compaction failed; send a message to retry");
+                "compaction blocked or failed; input is saved; send a message to retry" :
+                "compaction blocked or failed; send a message to retry");
             json_free(req);
             s->pending = NULL;
         }
@@ -210,8 +214,8 @@ static int settle_pending(Server *s)
         if (running(s) || s->engine.ready.head != s->engine.ready.n ||
             s->engine.leaves.head != s->engine.leaves.n)
             return 0;
-        if (s->engine.failed.head != s->engine.failed.n) {
-            error_response(req, "some compactions failed; send a message to retry");
+        if (s->engine.failed.head != s->engine.failed.n || s->engine.deferred.n) {
+            error_response(req, "some compactions blocked or failed; send a message to retry");
             json_free(req);
             s->pending = NULL;
             return 0;
@@ -220,10 +224,10 @@ static int settle_pending(Server *s)
     if (!strcmp(op, "flush")) {
         response(req, 1, NULL, NULL);
     } else {
-        view = view_render(&s->store, &s->store.view, s->before, 1);
-        if (strlen(view) > VIEW_HIGH) {
-            free(view);
-            if (running(s) || s->engine.ready.head != s->engine.ready.n)
+        view = view_render_limit(&s->store, &s->store.view, s->before, 1, VIEW_HIGH);
+        if (!view) {
+            if (running(s) || s->engine.ready.head != s->engine.ready.n ||
+                (s->engine.deferred.n && s->engine.deferred_ready))
                 return 0;
             error_response(req, "memory view exceeds 128000 bytes; input is saved; send a message to retry");
             json_free(req);

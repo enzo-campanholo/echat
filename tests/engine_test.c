@@ -473,6 +473,72 @@ static void unbuilt_compaction_parent(void)
     free(dir);
 }
 
+static void bounded_compaction_jobs(int long_leaves)
+{
+    Store s;
+    Engine e;
+    Job j;
+    char *dir, *context, source[1001], summary[501];
+    size_t blocked;
+    unsigned long i, calls;
+    int next;
+    dir = new_dir();
+    assert(store_open(&s, dir));
+    assert(!engine_open(&e, &s));
+    memset(source, 's', sizeof(source) - 1);
+    source[long_leaves ? 1000 : 500] = 0;
+    memset(summary, 's', 500); summary[500] = 0;
+    for (i = 0; i < 500; i++)
+        assert(store_append(&s, "note", source, NULL, NULL));
+    assert(!engine_sync(&e));
+    calls = 0;
+    while ((next = engine_next(&e, &j)) == 1) {
+        context = engine_context(&e, j);
+        assert(context && strlen(context) <= COMPACT_HIGH);
+        free(context);
+        if (j.ref.l)
+            engine_fail(&e, j);
+        else {
+            assert(long_leaves);
+            assert(!engine_done(&e, j, summary));
+        }
+        calls++;
+    }
+    assert(!next && calls);
+    if (long_leaves)
+        assert(e.contiguous < 500 && e.inflight == WORKERS);
+    else
+        assert(e.contiguous == 500 && e.compact.bytes > COMPACT_HIGH);
+    assert(e.deferred.n && e.failed.n != e.failed.head);
+    j.ref = ref(1, 249);
+    if (!long_leaves)
+        assert(!engine_context(&e, j));
+    blocked = e.deferred.n;
+    for (i = 0; i < 10; i++) {
+        assert(!engine_next(&e, &j));
+        assert(e.deferred.n == blocked);
+    }
+    /* Successful earlier parents release deferred jobs. The next message
+     * retries real failures, without losing or double-counting blocked work. */
+    assert(store_append(&s, "user", "retry", NULL, NULL));
+    assert(!engine_sync(&e));
+    calls = 0;
+    while ((next = engine_next(&e, &j)) == 1) {
+        context = engine_context(&e, j);
+        assert(context && strlen(context) <= COMPACT_HIGH);
+        free(context);
+        assert(!engine_done(&e, j, summary));
+        assert(++calls < 1000);
+    }
+    assert(!next && calls && e.contiguous == 501 && !e.inflight);
+    assert(!e.deferred.n && e.failed.head == e.failed.n);
+    assert(e.compact.bytes <= COMPACT_HIGH && s.view.bytes <= VIEW_HIGH);
+    engine_close(&e);
+    store_close(&s);
+    remove_dir(dir);
+    free(dir);
+}
+
 int main(void)
 {
     shortcuts_and_tasks();
@@ -482,6 +548,8 @@ int main(void)
     context_boundaries_and_persistence();
     rejected_compaction_view();
     unbuilt_compaction_parent();
+    bounded_compaction_jobs(0);
+    bounded_compaction_jobs(1);
     puts("engine: ok");
     return 0;
 }

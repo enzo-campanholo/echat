@@ -77,6 +77,8 @@ int main(void)
             }
             if (strncmp(message, "Too long:", 9)) {
                 assert(!strncmp(message, "<chat>\n", 7));
+                assert(strstr(message, "</chat>\n"));
+                assert((size_t)(strstr(message, "</chat>\n") - message) + 8 <= 32000);
                 assert(strstr(message, "Compaction:"));
                 assert(!strstr(message, "(not summarized yet:"));
                 assert(strstr(message, "<input>\n"));
