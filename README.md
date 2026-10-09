@@ -27,14 +27,15 @@ pi --no-session -e ./pi/unii.ts
 ```
 
 Pi must already have a working model/account. The turn uses whichever model
-you select in pi. Background summaries default to Anthropic
-`claude-haiku-4-5` at `xhigh` effort, using pi's credentials. You can select a
-different summary provider/model:
+you select in pi. Background summaries use GPT-6 Luna (`gpt-6-luna`), the
+current GPT Luna model, through `openai-codex` at `xhigh` effort, using pi's
+Codex credentials independently of the turn model. To set the summary
+provider/model explicitly:
 
 ```sh
 pi --no-session -e ./pi/unii.ts \
   --unii-dir "$HOME/.local/state/uniichat" \
-  --unii-provider anthropic --unii-model claude-haiku-4-5 --unii-effort xhigh
+  --unii-provider openai-codex --unii-model gpt-6-luna --unii-effort xhigh
 ```
 
 The default chat directory is `$XDG_STATE_HOME/uniichat`, or
@@ -76,7 +77,8 @@ and working directory are sent after the view. `UNII_INSTRUCTIONS` can name a
 UTF-8 file with additional personal instructions. Restart pi when changing
 these instructions so the prompt stays constant during a run.
 
-- `/unii`: show message count, summarized prefix, view size and worker status.
+- `/unii`: show message count, summarized prefix, view size, summary model
+  and worker status.
 - `/unii flush`: finish currently queued summaries; report any failed work.
 - `/unii import /path/to/file`: append a verbatim `note` to memory.
 - `zoom(id,n,page?)`: open an aligned power-of-two node into its children, or
@@ -100,6 +102,9 @@ to keep its view within 128,000 bytes. It reports a failure if either condition
 cannot be met. Its incoming words are already saved, and the next message
 retries failed work. Backend and persistence
 failures stop the turn and block subsequent tools.
+Background summary failures appear as pi notifications, with repeated errors
+reported once per turn. Authentication errors name the summary provider to
+select in `/login`; send another message after signing in to retry saved work.
 Unreadable or changed durable memory also stops the turn; an invalid zoom
 range or page is an ordinary tool error that the model can correct.
 

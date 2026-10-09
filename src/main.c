@@ -33,7 +33,7 @@ typedef struct Server {
     Json *pending;
     unsigned long before;
     unsigned long configuration;
-    int quitting, fatal;
+    int quitting, fatal, events;
     Buf input;
 } Server;
 
@@ -154,6 +154,10 @@ static void status(Server *s, const Json *req)
     buf_ulong(&b, (unsigned long)(s->engine.failed.n - s->engine.failed.head));
     buf_puts(&b, ",\"blocked\":");
     buf_ulong(&b, (unsigned long)s->engine.deferred.n);
+    if (s->config.model) {
+        buf_puts(&b, ",\"summary_provider\":"); buf_json(&b, s->config.provider);
+        buf_puts(&b, ",\"summary_model\":"); buf_json(&b, s->config.model);
+    }
     buf_puts(&b, "}\n");
     if (write_all(STDOUT_FILENO, b.s, b.len) < 0)
         interrupted = 1;
@@ -260,6 +264,8 @@ static int dispatch(Server *s, Json *req)
         } else if (s->system && strcmp(s->system, system) && running(s)) {
             error_response(req, "cannot change the system while compactions are running");
         } else {
+            j = json_get(req, "events");
+            s->events = j && j->type == J_BOOL && !strcmp(j->s, "true");
             s->configuration++;
             for (k = 0; k < WORKERS; k++) {
                 if (s->workers[k].live && !s->workers[k].working) {
@@ -420,8 +426,20 @@ static int consume(Server *s)
 
 static void failed_job(Server *s, Worker *w, const char *why)
 {
-    fprintf(stderr, "unii: compaction %lu+%lu failed: %s\n",
-        ref_start(w->job.ref), ref_span(w->job.ref), why);
+    Buf b;
+    if (s->events) {
+        buf_init(&b);
+        buf_puts(&b, "{\"event\":\"error\",\"provider\":"); buf_json(&b, s->config.provider);
+        buf_puts(&b, ",\"model\":"); buf_json(&b, s->config.model);
+        buf_puts(&b, ",\"text\":"); buf_json(&b, why);
+        buf_puts(&b, "}\n");
+        if (write_all(STDOUT_FILENO, b.s, b.len) < 0)
+            interrupted = 1;
+        buf_free(&b);
+    } else {
+        fprintf(stderr, "unii: compaction %lu+%lu failed: %s\n",
+            ref_start(w->job.ref), ref_span(w->job.ref), why);
+    }
     engine_fail(&s->engine, w->job);
     free(w->shortest);
     w->shortest = NULL;
@@ -695,8 +713,8 @@ int main(int argc, char **argv)
         path = path_join(assets, "bridge.mjs");
         s.config.command = env_default("UNII_PI", "pi");
         s.config.extension = path;
-        s.config.model = env_default("UNII_COMPACT_MODEL", "claude-haiku-4-5");
-        s.config.provider = env_default("UNII_COMPACT_PROVIDER", "anthropic");
+        s.config.model = env_default("UNII_COMPACT_MODEL", "gpt-6-luna");
+        s.config.provider = env_default("UNII_COMPACT_PROVIDER", "openai-codex");
         s.config.effort = env_default("UNII_COMPACT_EFFORT", "xhigh");
         s.config.compaction = 1;
         s.config.cache_gate = 1;

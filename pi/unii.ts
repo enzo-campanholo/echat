@@ -47,8 +47,8 @@ function ownInstructions(prompt: string): string[] {
 export default function (pi: any) {
   pi.registerFlag("unii-dir", { type: "string", description: "Directory for the permanent UniiChat log" });
   pi.registerFlag("unii-bin", { type: "string", description: "Path to the UniiChat C executable" });
-  pi.registerFlag("unii-model", { type: "string", description: "Cheap compaction model (default claude-haiku-4-5)" });
-  pi.registerFlag("unii-provider", { type: "string", description: "Compaction provider (default anthropic)" });
+  pi.registerFlag("unii-model", { type: "string", description: "Compaction model (default gpt-6-luna)" });
+  pi.registerFlag("unii-provider", { type: "string", description: "Compaction provider (default openai-codex)" });
   pi.registerFlag("unii-effort", { type: "string", description: "Compaction reasoning effort (default xhigh)" });
   let child: any, backend: any, ctx: any, startup: Promise<void> | undefined;
   let exited: Promise<void> | undefined;
@@ -59,6 +59,7 @@ export default function (pi: any) {
   let tools: any[] = [], providerTools: any[] | undefined;
   let shuttingDown = false;
   let failure: Error | undefined;
+  const summaryErrors = new Set<string>();
 
   const stop = (error: any, context = ctx) => {
     failure = error instanceof Error ? error : new Error(String(error));
@@ -85,7 +86,7 @@ export default function (pi: any) {
     const all = pi.getAllTools();
     tools = active.map((name: string) => all.find((tool: any) => tool.name === name)).filter(Boolean)
       .map((tool: any) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
-    const configuration: any = { system, tools };
+    const configuration: any = { system, tools, events: true };
     if (providerTools) configuration.provider_tools = providerTools;
     const signature = JSON.stringify(configuration);
     if (signature !== configured) {
@@ -105,8 +106,8 @@ export default function (pi: any) {
     system = baseSystem;
     const args = ["serve", directory, "--bridge", resolve(here, "bridge.mjs")];
     for (const [flag, variable, fallback] of [
-      ["model", "UNII_MODEL", "claude-haiku-4-5"],
-      ["provider", "UNII_PROVIDER", "anthropic"],
+      ["model", "UNII_MODEL", "gpt-6-luna"],
+      ["provider", "UNII_PROVIDER", "openai-codex"],
       ["effort", "UNII_EFFORT", "xhigh"],
     ]) args.push("--" + flag, String(pi.getFlag("unii-" + flag) || process.env[variable] || fallback));
     if (process.env.UNII_PI) args.push("--pi", process.env.UNII_PI);
@@ -116,7 +117,16 @@ export default function (pi: any) {
       child.once("error", () => resolveExit());
     });
     backend = new Records(child.stdout, child.stdin, (event: any) => {
-      if (event.event === "error" && ctx?.hasUI) ctx.ui.notify(event.text, "error");
+      if (event.event !== "error") return;
+      const reason = String(event.text).split(/\n|; stack=/, 1)[0];
+      const message = "UniiChat summary failed (" + event.provider + "/" + event.model + "): " + reason;
+      if (summaryErrors.has(message)) return;
+      summaryErrors.add(message);
+      const auth = /oauth|api key|credentials|authentication|unauthorized|\b40[13]\b/i.test(reason);
+      const help = auth ? "Use /login for " + event.provider + ", then send a message to retry."
+        : "Send a message to retry. /unii shows failed summaries.";
+      if (ctx?.hasUI) ctx.ui.notify(message + "\n" + help, "error");
+      else console.error(message + "\n" + help);
     }, (error: Error) => { if (!shuttingDown) stop(error); });
     child.on("error", (error: Error) => backend.fail(error));
     child.on("exit", (code: number, signal: string) => {
@@ -133,6 +143,7 @@ export default function (pi: any) {
       startup = undefined; backend = undefined; configured = "";
       providerTools = undefined; shuttingDown = false; running = false;
       failure = undefined;
+      summaryErrors.clear();
     }
     if (!startup) startup = launch().catch(stop);
     await startup;
@@ -156,7 +167,7 @@ export default function (pi: any) {
       await startup;
       await preparingInput;
       if (!backend || backend.closed) throw new Error("UniiChat backend is not running");
-      if (!running && context.isIdle()) failure = undefined;
+      if (!running && context.isIdle()) { failure = undefined; summaryErrors.clear(); }
       if (failure) throw failure;
       await request("append", { kind: "user", text: event.command });
     } catch (error) {
@@ -211,6 +222,7 @@ export default function (pi: any) {
         await request("steer", { text: event.text, images: event.images });
       } else {
         failure = undefined;
+        summaryErrors.clear();
         preparing = true;
         running = true;
         fresh = true;

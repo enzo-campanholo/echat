@@ -11,6 +11,8 @@
 
 typedef struct Client { FILE *in, *out; pid_t pid; } Client;
 static pid_t running;
+static int summary_notices;
+static char *summary_notice;
 static const char saved_input[] = "WORDS_SURVIVE_A_FAILED_PREDECESSOR";
 
 static void timeout_handler(int sig)
@@ -30,18 +32,22 @@ static void set_path(const char *name, const char *dir, const char *file)
     free(path);
 }
 
-/* A real backend with one injected failure, normally its first append. */
+/* A real backend with injected summary errors or a failed append. */
 static int proxy(int argc, char **argv)
 {
-    int input[2], output[2], status, n, r, appends, fail_append;
+    int input[2], output[2], status, n, r, appends, fail_append, summary_errors;
     pid_t pid;
     struct pollfd fds[2];
     char bytes[4096], *end;
     const char *op;
     Json *j;
     Buf pending;
+    static const char summary_error[] =
+        "{\"event\":\"error\",\"provider\":\"openai-codex\",\"model\":\"gpt-6-luna\","
+        "\"text\":\"OAuth refresh failed\\nTEST_STACK\\n\"}\n";
     assert(argc > 1 && getenv("UNII_TEST_REAL_BIN"));
     appends = 0;
+    summary_errors = getenv("UNII_TEST_SUMMARY_ERRORS") != NULL;
     fail_append = getenv("UNII_TEST_FAIL_APPEND") ? atoi(getenv("UNII_TEST_FAIL_APPEND")) : 1;
     assert(fail_append > 0);
     if (strcmp(argv[1], "serve")) {
@@ -79,6 +85,11 @@ static int proxy(int argc, char **argv)
                 j = json_parse(pending.s);
                 assert(j);
                 op = json_str(json_get(j, "op"));
+                if (summary_errors && op && !strcmp(op, "configure")) {
+                    assert(write_all(1, summary_error, sizeof(summary_error) - 1) == 0);
+                    assert(write_all(1, summary_error, sizeof(summary_error) - 1) == 0);
+                    summary_errors = 0;
+                }
                 if (op && !strcmp(op, "append") && ++appends == fail_append) {
                     json_free(j);
                     kill(pid, SIGTERM);
@@ -107,6 +118,8 @@ static Client start(const char *project)
     Client c;
     int input[2], output[2];
     char *extension, *provider;
+    summary_notices = 0;
+    free(summary_notice); summary_notice = NULL;
     extension = path_join(project, "pi/unii.ts");
     provider = path_join(project, "tests/pi_failure_model.ts");
     assert(!pipe(input) && !pipe(output));
@@ -147,7 +160,7 @@ static void accepted(Client *c, const char *disposition)
 {
     Buf line;
     Json *j;
-    const char *type, *actual;
+    const char *type, *actual, *message;
     int done;
     done = 0;
     buf_init(&line);
@@ -155,6 +168,12 @@ static void accepted(Client *c, const char *disposition)
         j = json_parse(line.s);
         assert(j);
         type = json_str(json_get(j, "type"));
+        message = json_str(json_get(j, "message"));
+        if (type && !strcmp(type, "extension_ui_request") &&
+            message && strstr(message, "UniiChat summary failed")) {
+            summary_notices++;
+            free(summary_notice); summary_notice = xstrdup(message);
+        }
         if (type && !strcmp(type, "response")) {
             actual = json_str(json_get(json_get(j, "data"), "disposition"));
             if (!actual || strcmp(actual, disposition)) {
@@ -237,6 +256,7 @@ static char *setup(const char *project, const char *dir, const char *name)
     assert(!unsetenv("UNII_TEST_FAIL_ONCE"));
     assert(!unsetenv("UNII_TEST_ZOOM"));
     assert(!unsetenv("UNII_TEST_MISSING_LOG"));
+    assert(!unsetenv("UNII_TEST_SUMMARY_ERRORS") && !unsetenv("UNII_TEST_FAIL_APPEND"));
     return path;
 }
 
@@ -300,6 +320,19 @@ int main(int argc, char **argv)
     send_prompt(&c, 1, "MUST_STOP_WITHOUT_MEMORY"); accepted(&c, "handled");
     stop(&c); check_calls(dir, 0, 0); free(dir);
 
+    dir = setup(project, argv[1], "summary-errors");
+    set_path("UNII_TEST_REAL_BIN", project, "unii");
+    set_path("UNII_BIN", project, "tests/pi_failure_test");
+    assert(!setenv("UNII_TEST_FAIL_APPEND", "100", 1));
+    assert(!setenv("UNII_TEST_SUMMARY_ERRORS", "1", 1));
+    c = start(project);
+    send_prompt(&c, 1, "SUMMARY_ERRORS_MUST_NOT_STOP_THE_REPLY"); accepted(&c, "started");
+    assert(summary_notices == 1 && summary_notice);
+    assert(strstr(summary_notice, "openai-codex/gpt-6-luna"));
+    assert(strstr(summary_notice, "Use /login for openai-codex"));
+    assert(!strstr(summary_notice, "TEST_STACK"));
+    settled(&c); stop(&c); check_calls(dir, 2, 1); free(dir);
+
     dir = setup(project, argv[1], "predecessor");
     set_path("UNII_TEST_FAIL_ONCE", dir, "failed-once");
     chat = path_join(dir, "chat");
@@ -348,6 +381,7 @@ int main(int argc, char **argv)
     send_prompt(&c, 1, saved_input); accepted(&c, "started");
     settled(&c); stop(&c);
     check_calls(dir, 3, 1); saved_words(dir); free(dir);
-    puts("live Pi failures: durable input, blocked tools, fatal reads, recoverable zoom errors OK");
+    free(summary_notice);
+    puts("live Pi failures: summary notices, durable input, blocked tools, fatal reads, recoverable zoom errors OK");
     return 0;
 }

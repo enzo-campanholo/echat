@@ -96,24 +96,33 @@ static void stop(Client *c)
     assert(WIFEXITED(status) && !WEXITSTATUS(status));
 }
 
-static void failed_input(const char *root, const char *text)
+static void failed_input(const char *root, const char *text, int events)
 {
     Client c;
     char *dir, *marker;
     Json *j;
     unsigned long count;
     const char *view;
-    dir = path_join(root, "failed-input");
-    marker = path_join(root, "fail-once");
+    dir = path_join(root, events ? "failed-events" : "failed-input");
+    marker = path_join(dir, "fail-once");
     assert(!setenv("UNII_TEST_FAIL_ONCE", marker, 1));
     c = start(dir);
     assert(!unsetenv("UNII_TEST_FAIL_ONCE"));
     ok(request(&c, "append", "note", text));
     /* Dispatch both before the workers run, making the failure deterministic. */
-    send(&c, "configure", NULL, "fixed system");
+    assert(fprintf(c.out, "{\"id\":%lu,\"op\":\"configure\",\"system\":\"fixed system\",\"events\":%s}\n",
+                   ++c.serial, events ? "true" : "false") > 0);
     send(&c, "turn", NULL, "INPUT_SAVED_DESPITE_SUMMARY_FAILURE");
     assert(!fflush(c.out));
     ok(receive(&c));
+    if (events) {
+        j = receive(&c);
+        assert(!strcmp(json_str(json_get(j, "event")), "error"));
+        assert(json_str(json_get(j, "provider")) && json_str(json_get(j, "model")));
+        assert(!strcmp(json_str(json_get(j, "text")), "test transient failure"));
+        assert(!json_get(j, "id") && !json_get(j, "error"));
+        json_free(j);
+    }
     j = receive(&c);
     assert(json_str(json_get(j, "error")));
     json_free(j);
@@ -371,7 +380,8 @@ int main(int argc, char **argv)
     before = read_file(path);
     assert(before);
     stop(&c);
-    failed_input(argv[1], text);
+    failed_input(argv[1], text, 0);
+    failed_input(argv[1], text, 1);
     invalid_protocol(argv[1]);
     fatal_storage(argv[1]);
     worker_read_fault(argv[1], text);
