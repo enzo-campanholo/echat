@@ -86,6 +86,10 @@ int main(void)
             assert(strstr(socket_line.s, "ready"));
             fputs("{\"type\":\"response_started\"}\n", bridge);
             fail = 0;
+            fail_path = getenv("UNII_TEST_FAIL_MERGES");
+            if (fail_path && access(fail_path, F_OK) == 0 &&
+                strstr(message, "Compaction: merge lines"))
+                fail = 1;
             fail_path = getenv("UNII_TEST_FAIL_ONCE");
             if (fail_path) {
                 fd = open(fail_path, O_WRONLY | O_CREAT | O_EXCL, 0600);

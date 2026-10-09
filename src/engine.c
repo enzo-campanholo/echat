@@ -123,7 +123,8 @@ static int load_compact(Engine *e)
             goto bad;
         r.l = (unsigned int)l;
         r.i = i;
-        if (!store_valid_ref(e->store, r) || ref_start(r) != end)
+        if (!store_valid_ref(e->store, r) || ref_start(r) != end ||
+            (r.l && !store_node(e->store, r)))
             goto bad;
         end += ref_span(r);
         view_add(&e->compact, r);

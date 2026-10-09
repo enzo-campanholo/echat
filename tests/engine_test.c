@@ -446,6 +446,33 @@ static void rejected_compaction_view(void)
     free(dir);
 }
 
+static void unbuilt_compaction_parent(void)
+{
+    Store s;
+    Engine e;
+    char *dir, *saved, *after, summary[501];
+    unsigned long i;
+    dir = new_dir();
+    assert(store_open(&s, dir));
+    memset(summary, 's', sizeof(summary) - 1);
+    summary[sizeof(summary) - 1] = 0;
+    for (i = 0; i < 4; i++) {
+        assert(store_append(&s, "note", "source", NULL, NULL));
+        assert(store_build(&s, ref(0, i), summary));
+    }
+    put_file(dir, "compaction-view.json", "{\"shrinking\":0,\"view\":[[2,0]]}\n");
+    saved = get_file(dir, "compaction-view.json");
+    assert(engine_open(&e, &s) == -1);
+    assert(strstr(s.error, "refusing to rebuild"));
+    after = get_file(dir, "compaction-view.json");
+    assert(!strcmp(saved, after));
+    free(saved); free(after);
+    engine_close(&e);
+    store_close(&s);
+    remove_dir(dir);
+    free(dir);
+}
+
 int main(void)
 {
     shortcuts_and_tasks();
@@ -454,6 +481,7 @@ int main(void)
     parent_jobs_once();
     context_boundaries_and_persistence();
     rejected_compaction_view();
+    unbuilt_compaction_parent();
     puts("engine: ok");
     return 0;
 }

@@ -1,5 +1,6 @@
 #include "base.h"
 #include <assert.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +12,7 @@ typedef struct Client { FILE *in, *out; pid_t pid; unsigned long serial; } Clien
 
 static Client start_binary(const char *dir, const char *binary)
 {
-    int in[2], out[2];
+    int in[2], out[2], quiet;
     Client c;
     assert(!pipe(in) && !pipe(out));
     c.pid = fork();
@@ -19,6 +20,11 @@ static Client start_binary(const char *dir, const char *binary)
     if (!c.pid) {
         assert(dup2(in[0], 0) >= 0 && dup2(out[1], 1) >= 0);
         close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+        if (getenv("UNII_TEST_FAIL_MERGES")) {
+            quiet = open("/dev/null", O_WRONLY);
+            assert(quiet >= 0 && dup2(quiet, STDERR_FILENO) >= 0);
+            close(quiet);
+        }
         execl(binary, "unii", "serve", dir, "--pi", "./tests/fake_pi", (char *)NULL);
         _exit(127);
     }
@@ -111,8 +117,12 @@ static void failed_input(const char *root, const char *text)
     j = receive(&c);
     assert(json_str(json_get(j, "error")));
     json_free(j);
+    j = request(&c, "flush", NULL, NULL);
+    assert(json_str(json_get(j, "error")));
+    json_free(j);
     j = request(&c, "status", NULL, NULL);
     assert(json_ulong(json_get(j, "messages"), &count) && count == 2);
+    assert(json_ulong(json_get(j, "failed"), &count) && count == 1);
     ok(j);
     j = request(&c, "turn", NULL, "retry after failure");
     view = json_str(json_get(j, "view"));
@@ -146,23 +156,29 @@ static void invalid_protocol(const char *root)
     free(dir);
 }
 
+static char *daily_log(const char *dir)
+{
+    char date[32];
+    time_t now;
+    struct tm utc;
+    now = time(NULL);
+    assert(now != (time_t)-1 && gmtime_r(&now, &utc));
+    assert(strftime(date, sizeof(date), "main/%Y-%m-%d.jsonl", &utc));
+    return path_join(dir, date);
+}
+
 static void fatal_storage(const char *root)
 {
     static const char first[] = "FIRST_RECORD_SURVIVES_FAILED_SYNC";
     Client c;
-    char date[32], *dir, *log;
-    time_t now;
-    struct tm utc;
+    char *dir, *log;
     FILE *f;
     Buf line;
     Json *j;
     unsigned long id, count;
     int status;
     dir = path_join(root, "fatal-storage");
-    now = time(NULL);
-    assert(now != (time_t)-1 && gmtime_r(&now, &utc));
-    assert(strftime(date, sizeof(date), "main/%Y-%m-%d.jsonl", &utc));
-    log = path_join(dir, date);
+    log = daily_log(dir);
     assert(!setenv("UNII_TEST_FSYNC_PATH", log, 1));
     c = start_binary(dir, "./tests/fsync_test");
     assert(!unsetenv("UNII_TEST_FSYNC_PATH"));
@@ -195,18 +211,90 @@ static void fatal_storage(const char *root)
     free(dir); free(log);
 }
 
-static void backlog(const char *root, const char *source)
+static void worker_read_fault(const char *root, const char *text)
 {
     Client c;
-    char *dir, *p, *end;
+    char *dir, *log;
+    Buf line;
+    Json *j;
+    FILE *f;
+    unsigned long count;
+    int status;
+    dir = path_join(root, "worker-read-fault");
+    log = daily_log(dir);
+    assert(!setenv("UNII_TEST_READ_PATH", log, 1));
+    c = start_binary(dir, "./tests/fsync_test");
+    assert(!unsetenv("UNII_TEST_READ_PATH"));
+    ok(request(&c, "append", "note", text));
+    send(&c, "configure", NULL, "fixed system");
+    send(&c, "flush", NULL, NULL);
+    assert(!fflush(c.out));
+    ok(receive(&c));
+    /* engine_next reads the source; engine_task's second read fails. */
+    j = receive(&c);
+    assert(json_str(json_get(j, "error")));
+    assert(!strcmp(json_get(j, "fatal")->s, "true"));
+    json_free(j);
+    buf_init(&line);
+    assert(read_line(c.in, &line) == 0);
+    assert(!fclose(c.in) && !fclose(c.out));
+    assert(waitpid(c.pid, &status, 0) == c.pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    f = fopen(log, "rb");
+    assert(f && read_line(f, &line) == 1);
+    j = json_parse(line.s);
+    assert(j && !strcmp(json_str(json_get(j, "text")), text));
+    json_free(j);
+    assert(read_line(f, &line) == 0 && !fclose(f));
+    buf_free(&line);
+    c = start(dir);
+    j = request(&c, "status", NULL, NULL);
+    assert(json_ulong(json_get(j, "messages"), &count) && count == 1);
+    ok(j);
+    stop(&c);
+    free(dir); free(log);
+}
+
+static void check_coverage(const char *view, unsigned long total)
+{
+    char *p, *end;
+    unsigned long id, n, covered;
+    assert(view && strlen(view) <= 128000);
+    assert(!strstr(view, "not summarized yet"));
+    covered = 0;
+    for (p = (char *)view + 7; *p != '<'; p = end + 1) {
+        id = strtoul(p, &end, 10);
+        assert(end != p && *end == '+');
+        n = strtoul(end + 1, &end, 10);
+        assert(*end == '|' && n && !(n & (n - 1)));
+        assert(id == covered && !(id % n) && n <= total - covered);
+        covered += n;
+        end = strchr(end, '\n');
+        assert(end);
+    }
+    assert(covered == total && !strcmp(p, "</chat>\n"));
+}
+
+static void backlog(const char *root, const char *source, int fail_merges)
+{
+    Client c;
+    char *dir, *marker;
     const char *view;
     Json *j;
-    unsigned long id, n, covered;
+    FILE *f;
+    unsigned long count;
     int k;
-    dir = path_join(root, "backlog");
+    dir = path_join(root, fail_merges ? "failed-backlog" : "backlog");
+    marker = path_join(root, "fail-merges");
+    if (fail_merges) {
+        f = fopen(marker, "w");
+        assert(f && !fclose(f));
+        assert(!setenv("UNII_TEST_FAIL_MERGES", marker, 1));
+    }
     assert(!setenv("UNII_TEST_SUMMARY_BYTES", "500", 1));
     c = start(dir);
     assert(!unsetenv("UNII_TEST_SUMMARY_BYTES"));
+    assert(!unsetenv("UNII_TEST_FAIL_MERGES"));
     for (k = 0; k < 500; k++)
         ok(request(&c, "append", "note", source));
     send(&c, "configure", NULL, "fixed system");
@@ -214,24 +302,29 @@ static void backlog(const char *root, const char *source)
     assert(!fflush(c.out));
     ok(receive(&c));
     j = receive(&c);
-    view = json_str(json_get(j, "view"));
-    assert(view && strlen(view) <= 128000);
-    assert(!strstr(view, "not summarized yet") && !strstr(view, "NEW_INPUT"));
-    covered = 0;
-    for (p = (char *)view + 7; *p != '<'; p = end + 1) {
-        id = strtoul(p, &end, 10);
-        assert(end != p && *end == '+');
-        n = strtoul(end + 1, &end, 10);
-        assert(*end == '|' && n && !(n & (n - 1)));
-        assert(id == covered && !(id % n) && n <= 500 - covered);
-        covered += n;
-        end = strchr(end, '\n');
-        assert(end);
+    if (fail_merges) {
+        assert(json_str(json_get(j, "error")) && !json_get(j, "view"));
+        json_free(j);
+        j = request(&c, "status", NULL, NULL);
+        assert(json_ulong(json_get(j, "messages"), &count) && count == 501);
+        assert(json_ulong(json_get(j, "summarized"), &count) && count == 501);
+        assert(json_ulong(json_get(j, "failed"), &count) && count > 0);
+        ok(j);
+        /* Only a new message may retry the failed parents. Once the fault
+         * clears, the saved input is covered by a bounded preceding view. */
+        assert(!unlink(marker));
+        j = request(&c, "turn", NULL, "RETRY_INPUT_AFTER_PARENT_FAILURE");
+        view = json_str(json_get(j, "view"));
+        check_coverage(view, 501);
+        assert(!strstr(view, "RETRY_INPUT"));
+    } else {
+        view = json_str(json_get(j, "view"));
+        check_coverage(view, 500);
+        assert(!strstr(view, "NEW_INPUT"));
     }
-    assert(covered == 500 && !strcmp(p, "</chat>\n"));
     ok(j);
     stop(&c);
-    free(dir);
+    free(dir); free(marker);
 }
 
 int main(int argc, char **argv)
@@ -276,7 +369,9 @@ int main(int argc, char **argv)
     failed_input(argv[1], text);
     invalid_protocol(argv[1]);
     fatal_storage(argv[1]);
-    backlog(argv[1], text);
+    worker_read_fault(argv[1], text);
+    backlog(argv[1], text, 0);
+    backlog(argv[1], text, 1);
     c = start(argv[1]);
     ok(request(&c, "configure", NULL, "fixed system"));
     after = read_file(path);

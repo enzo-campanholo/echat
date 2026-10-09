@@ -44,7 +44,7 @@ tests/pi_test: tests/pi_test.c src/pi.o src/base.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/pi_test.c src/pi.o src/base.o
 
 tests/fsync_test: tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/pi.c src/main.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Dfsync=unii_test_fsync -Isrc -o $@ tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/pi.c src/main.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Dfsync=unii_test_fsync -Dfopen=unii_test_fopen -Isrc -o $@ tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/pi.c src/main.c
 
 test: all tests/base_test tests/store_test tests/view_test tests/fake_pi tests/fsync_test tests/server_test tests/engine_test tests/pi_test
 	./tests/base_test

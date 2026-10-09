@@ -86,9 +86,10 @@ printf 'Personal instructions or earlier memories.\n' | ./unii add CHAT note
 
 Imports build short nodes without a model. Long imports are summarized when
 the extension starts. A failed model call stays queued for the next message;
-a fresh turn waits for all earlier message summaries and reports a failure
-instead of proceeding with partial memory. Its incoming words are already
-saved, and the next message retries failed work. Backend and persistence
+a fresh turn waits for all earlier message summaries and enough built parents
+to keep its view within 128,000 bytes. It reports a failure if either condition
+cannot be met. Its incoming words are already saved, and the next message
+retries failed work. Backend and persistence
 failures stop the turn and block subsequent tools.
 Unreadable or changed durable memory also stops the turn; an invalid zoom
 range or page is an ordinary tool error that the model can correct.

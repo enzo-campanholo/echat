@@ -221,6 +221,15 @@ static int settle_pending(Server *s)
         response(req, 1, NULL, NULL);
     } else {
         view = view_render(&s->store, &s->store.view, s->before, 1);
+        if (strlen(view) > VIEW_HIGH) {
+            free(view);
+            if (running(s) || s->engine.ready.head != s->engine.ready.n)
+                return 0;
+            error_response(req, "memory view exceeds 128000 bytes; input is saved; send a message to retry");
+            json_free(req);
+            s->pending = NULL;
+            return 0;
+        }
         response(req, 1, "view", view);
         free(view);
     }
@@ -284,8 +293,6 @@ static int dispatch(Server *s, Json *req)
         } else if (!strcmp(op, "turn") && !text) {
             error_response(req, "turn needs text");
         } else {
-            /* Failed calls retry only at an incoming message. No timed retry. */
-            engine_retry(&s->engine);
             s->before = s->store.count;
             /* Record input before waiting, but retain the preceding boundary.
              * Rendering follows live batches while opening any crossing node. */
@@ -433,11 +440,15 @@ static int workers_step(Server *s)
     memset(&callbacks, 0, sizeof(callbacks));
     callbacks.opaque = s;
     callbacks.memory = memory;
+    if (s->store.broken)
+        return -1;
     for (k = 0; k < WORKERS; k++) {
         w = &s->workers[k];
         if (!w->live || !w->working)
             continue;
         pi_process(&w->pi, &callbacks);
+        if (s->store.broken)
+            return -1;
         if (w->pi.prefix_waiting) {
             blocked = s->frontend_writing && s->frontend_key &&
                 !strcmp(s->frontend_key, w->pi.prefix_key);
@@ -523,6 +534,12 @@ static int workers_step(Server *s)
         task = engine_task(&s->engine, w->job);
         view = engine_context(&s->engine, w->job);
         images = w->job.ref.l ? NULL : store_images(&s->store, w->job.ref.i);
+        if (s->store.broken) {
+            free(task);
+            free(view);
+            free(images);
+            return -1;
+        }
         if (!task || !view || (!w->job.ref.l &&
             s->store.messages[w->job.ref.i].has_images && !images) ||
             pi_prompt_images(&w->pi, view, task, images, 1) < 0) {
@@ -549,7 +566,11 @@ static int serve(Server *s)
     signal(SIGPIPE, SIG_IGN);
     result = 0;
     while (!s->quitting && !s->fatal && !interrupted) {
-        if (workers_step(s) < 0) { result = -1; break; }
+        if (workers_step(s) < 0) {
+            storage_error(s, s->pending ? s->pending : s->cache_wait);
+            result = -1;
+            break;
+        }
         count = 0;
         fds[count].fd = STDIN_FILENO;
         fds[count].events = POLLIN;

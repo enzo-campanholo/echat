@@ -1,7 +1,10 @@
-/* Fail one append's sync after its complete log record has been written. */
+/* Inject storage faults without changing production code or using a loader. */
 #undef fsync
+#undef fopen
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -18,4 +21,16 @@ int unii_test_fsync(int fd)
         return -1;
     }
     return fsync(fd);
+}
+
+FILE *unii_test_fopen(const char *path, const char *mode)
+{
+    static unsigned int reads;
+    const char *target;
+    target = getenv("UNII_TEST_READ_PATH");
+    if (target && !strcmp(path, target) && !strcmp(mode, "rb") && ++reads == 2) {
+        errno = EIO;
+        return NULL;
+    }
+    return fopen(path, mode);
 }
