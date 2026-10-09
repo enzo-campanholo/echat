@@ -62,6 +62,12 @@ Messages arriving during memory preparation or a reply are logged as steering
 and remain in that turn. Its view stays at the boundary before the initiating
 message.
 
+Pi's included `!command` and RPC bash executions are also part of memory: the
+user's command is saved before execution, followed by its clipped output and
+exit status. Pi's explicit `!!command` / `excludeFromContext` option keeps that
+execution outside UniiChat memory. Included shell commands stop when memory
+cannot be saved.
+
 ## Instructions and commands
 
 The shared prompt is [pi/prompt.txt](pi/prompt.txt). Pi's project instructions

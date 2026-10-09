@@ -30,10 +30,10 @@ static void set_path(const char *name, const char *dir, const char *file)
     free(path);
 }
 
-/* A real backend with one injected failure: its first assistant append dies. */
+/* A real backend with one injected failure, normally its first append. */
 static int proxy(int argc, char **argv)
 {
-    int input[2], output[2], status, n, r;
+    int input[2], output[2], status, n, r, appends, fail_append;
     pid_t pid;
     struct pollfd fds[2];
     char bytes[4096], *end;
@@ -41,6 +41,9 @@ static int proxy(int argc, char **argv)
     Json *j;
     Buf pending;
     assert(argc > 1 && getenv("UNII_TEST_REAL_BIN"));
+    appends = 0;
+    fail_append = getenv("UNII_TEST_FAIL_APPEND") ? atoi(getenv("UNII_TEST_FAIL_APPEND")) : 1;
+    assert(fail_append > 0);
     if (strcmp(argv[1], "serve")) {
         execv(getenv("UNII_TEST_REAL_BIN"), argv);
         return 127;
@@ -76,7 +79,7 @@ static int proxy(int argc, char **argv)
                 j = json_parse(pending.s);
                 assert(j);
                 op = json_str(json_get(j, "op"));
-                if (op && !strcmp(op, "append")) {
+                if (op && !strcmp(op, "append") && ++appends == fail_append) {
                     json_free(j);
                     kill(pid, SIGTERM);
                     assert(waitpid(pid, &status, 0) == pid);

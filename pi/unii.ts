@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createLocalBashOperations, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Records, registerMemory, stableContext, chatBlocks, cachePayload } from "./common.mjs";
 
 const exec = promisify(execFile);
@@ -24,6 +25,13 @@ function clip(text: string): string {
   const tail = 30000 - marker.length - head;
   return chars.slice(0, head).join("") + marker + chars.slice(-tail).join("");
 }
+
+/* Match Pi's native bash normalization, including ANSI split across chunks. */
+const ansiEnd = "(?:\\u0007|\\u001B\\u005C|\\u009C)";
+const ansiOsc = "\\u001B\\]";
+const ansiCsi = "[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?";
+const ansiCodes = new RegExp(`(?:${ansiOsc}[\\s\\S]*?${ansiEnd})|${ansiCsi}[\\dA-PR-TZcf-nq-uy=><~]`, "g");
+const ansiPending = new RegExp(`(?:${ansiOsc}(?:[^\\u0007\\u009C\\u001B]|\\u001B(?!\\\\))*|${ansiCsi})$`);
 
 /* Pi's structured prompt keeps user instructions separate from device state. */
 function ownInstructions(prompt: string): string[] {
@@ -140,6 +148,53 @@ export default function (pi: any) {
   });
   pi.on("cache_warming_decision", () => ({ action: "stop" }));
   pi.on("session_before_compact", () => ({ cancel: true }));
+
+  pi.on("user_bash", async (event: any, context: any) => {
+    if (event.excludeFromContext) return;
+    ctx = context;
+    try {
+      await startup;
+      await preparingInput;
+      if (!backend || backend.closed) throw new Error("UniiChat backend is not running");
+      if (!running && context.isIdle()) failure = undefined;
+      if (failure) throw failure;
+      await request("append", { kind: "user", text: event.command });
+    } catch (error) {
+      stop(error, context);
+      throw error; /* user_bash errors block execution instead of falling through. */
+    }
+    const settings = SettingsManager.create(event.cwd, undefined, { projectTrusted: context.isProjectTrusted() });
+    const local = createLocalBashOperations({ shellPath: settings.getShellPath() });
+    return { operations: {
+      async exec(command: string, cwd: string, options: any) {
+        const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+        let output = "", pending = "", result: any, executionError: any;
+        const capture = (text: string, final = false) => {
+          text = pending + text;
+          const window = Math.max(0, text.length - 256);
+          const unfinished = final ? null : ansiPending.exec(text.slice(window));
+          const end = unfinished ? window + unfinished.index : text.length;
+          pending = text.slice(end);
+          text = text.slice(0, end).replace(ansiCodes, "")
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uFFF9-\uFFFB]/g, "").replace(/\r/g, "");
+          output = clip(output + text);
+        };
+        try {
+          result = await local.exec(command, cwd, { ...options, onData(data: Buffer) {
+            capture(decoder.decode(data, { stream: true }));
+            options.onData(data);
+          } });
+        } catch (error) { executionError = error; }
+        capture(decoder.decode(), true);
+        let status = "bash: exit=" + (result?.exitCode ?? "unknown") + " cancelled=" + Boolean(options.signal?.aborted);
+        if (executionError) status += " error=" + JSON.stringify(String(executionError));
+        try { await request("append", { kind: "echo", text: status + "\n" + output }); }
+        catch (error) { stop(error, context); throw error; }
+        if (executionError) throw executionError;
+        return result;
+      },
+    } };
+  });
 
   registerMemory(pi, async (name: string, args: any) => await request(name, { args }));
   pi.on("tool_call", () => failure ? { block: true, reason: failure.message, terminate: true } : undefined);
