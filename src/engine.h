@@ -15,9 +15,8 @@ typedef struct Engine {
     Store *store;
     Queue ready, leaves, failed;
     View compact;
-    unsigned long seen, contiguous, epoch;
+    unsigned long seen, contiguous;
     unsigned int inflight;
-    int compact_loaded;
 } Engine;
 
 int engine_open(Engine *e, Store *s);

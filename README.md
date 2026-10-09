@@ -90,6 +90,8 @@ a fresh turn waits for all earlier message summaries and reports a failure
 instead of proceeding with partial memory. Its incoming words are already
 saved, and the next message retries failed work. Backend and persistence
 failures stop the turn and block subsequent tools.
+Unreadable or changed durable memory also stops the turn; an invalid zoom
+range or page is an ordinary tool error that the model can correct.
 
 ## Storage and scheduling
 
@@ -143,8 +145,9 @@ with exact integer comparisons and the oldest equal-age pair first. An
 unfinished batch resumes as parents become available. The compaction view
 uses the same rule at 32,000 → 16,000 bytes and follows turn-view batches.
 
-For Anthropic, view text uses four-line blocks and two ephemeral cache marks:
-the last full block and the request end. Calls writing the same prefix wait
+For Anthropic, view text uses four-line blocks and ephemeral cache marks on
+the shared system prefix, the last full view block, and the request end.
+Calls writing the same prefix wait
 until the first response begins. There are no one-hour cache purchases,
 keepalive requests or native pi compactions. Cache behavior still depends on
 the provider, model, account, and entry lifetime; no live hit-rate claim is

@@ -158,11 +158,44 @@ static void availability(void)
     clear(&s);
 }
 
+static void cutoff(void)
+{
+    Store s;
+    Ref r;
+    char *text, *p, *end;
+    unsigned long i, cut, id, n, covered;
+    memset(&s, 0, sizeof(s));
+    s.count = 16;
+    for (i = 0; i < s.count; i++)
+        build(&s, i, "note: summary");
+    r.l = 4; r.i = 0;
+    view_add(&s.view, r);
+    for (cut = 0; cut <= s.count; cut++) {
+        text = view_render(&s, &s.view, cut, 1);
+        covered = 0;
+        for (p = text + 7; *p != '<'; p = end + 1) {
+            id = strtoul(p, &end, 10);
+            assert(end != p && *end == '+');
+            n = strtoul(end + 1, &end, 10);
+            assert(*end == '|' && n && !(n & (n - 1)));
+            assert(id == covered && !(id % n) && n <= cut - covered);
+            covered += n;
+            end = strchr(end, '\n');
+            assert(end);
+        }
+        assert(covered == cut && !strcmp(p, "</chat>\n"));
+        free(text);
+    }
+    assert(s.view.n == 1 && s.view.v[0].l == 4);
+    clear(&s);
+}
+
 int main(void)
 {
     equivalence();
     sawtooth();
     availability();
+    cutoff();
     puts("view: rollback equivalence through 20,000 pushes; byte sawtooth; availability OK");
     return 0;
 }

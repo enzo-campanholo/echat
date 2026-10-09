@@ -66,7 +66,7 @@ export function stableContext(messages, system, tools) {
   ];
 }
 
-/* Anthropic marks two boundaries: last complete four-line block, request end. */
+/* Cache the shared tools/system, the last four-line block, and request end. */
 export function cachePayload(payload, providerTools) {
   if (!payload || !Array.isArray(payload.messages) || !Array.isArray(payload.system) || !("max_tokens" in payload)) return { payload };
   if (providerTools) payload.tools = structuredClone(providerTools);
@@ -80,6 +80,8 @@ export function cachePayload(payload, providerTools) {
   };
   clean(payload.system); clean(payload.tools);
   for (const message of payload.messages) clean(message.content);
+  const base = payload.system.at(-1);
+  if (base) base.cache_control = { type: "ephemeral" };
   let mark, prefix;
   for (let mi = 0; mi < payload.messages.length; mi++) {
     const message = payload.messages[mi];
@@ -102,9 +104,9 @@ export function cachePayload(payload, providerTools) {
   if (last && typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
   const final = last?.content?.at(-1);
   if (final && final.type !== "thinking" && final.type !== "redacted_thinking") final.cache_control = { type: "ephemeral" };
-  if (!prefix) return { payload };
-  const [mi, bi] = prefix;
-  const messages = payload.messages.slice(0, mi + 1).map((m, i) => i === mi ? { ...m, content: m.content.slice(0, bi + 1) } : m);
+  if (!prefix && !base) return { payload };
+  const messages = prefix ? payload.messages.slice(0, prefix[0] + 1).map((m, i) =>
+    i === prefix[0] ? { ...m, content: m.content.slice(0, prefix[1] + 1) } : m) : [];
   const key = createHash("sha256").update(JSON.stringify({ model: payload.model, tools: payload.tools, system: payload.system, messages })).digest("hex");
   return { payload, key };
 }
@@ -126,7 +128,7 @@ export class Records {
         this.buffer = this.buffer.subarray(end + 1);
         try {
           const record = JSON.parse(bytes.toString("utf8"));
-          if ((record.ok === false || record.error) && record.id == null) {
+          if (record.fatal || ((record.ok === false || record.error) && record.id == null)) {
             this.fail(new Error(record.error || "UniiChat protocol error"));
             return;
           }

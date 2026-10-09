@@ -77,12 +77,12 @@ static Json *request(FILE *input, FILE *output, unsigned long *serial,
 
 static void contexts(const char *dir)
 {
-    char *path;
+    char *path, *base, *current;
     const char *text;
     FILE *f;
-    Buf line;
+    Buf line, encoded;
     Json *j;
-    const Json *context, *message, *payload, *block;
+    const Json *context, *message, *payload, *block, *system, *control;
     unsigned long pid, pids[8];
     size_t counts[8], n, k, total, gated, marked;
     path = path_join(dir, "worker.jsonl");
@@ -90,6 +90,7 @@ static void contexts(const char *dir)
     assert(f);
     free(path);
     n = total = gated = 0;
+    base = NULL;
     memset(counts, 0, sizeof(counts));
     buf_init(&line);
     while (read_line(f, &line) == 1) {
@@ -106,6 +107,18 @@ static void contexts(const char *dir)
         message = message->next;
         assert(message && !message->next && !strcmp(json_str(json_get(message, "role")), "user"));
         payload = json_get(j, "payload");
+        system = json_get(payload, "system");
+        assert(system && system->type == J_ARR && system->child);
+        for (block = system->child; block->next; block = block->next) ;
+        control = json_get(block, "cache_control");
+        assert(control && !strcmp(json_str(json_get(control, "type")), "ephemeral"));
+        assert(!json_get(control, "ttl"));
+        buf_init(&encoded);
+        json_dump(&encoded, system);
+        current = encoded.s;
+        if (!base) base = xstrdup(current);
+        assert(!strcmp(base, current));
+        free(current);
         message = json_get(payload, "messages")->child;
         marked = 0;
         for (block = json_get(message, "content")->child; block; block = block->next) {
@@ -121,6 +134,7 @@ static void contexts(const char *dir)
     assert(total == 31 && gated > 0);
     for (k = 0; k < n; k++) if (counts[k] > 1) break;
     assert(k < n);
+    free(base);
     buf_free(&line);
     assert(fclose(f) == 0);
 }

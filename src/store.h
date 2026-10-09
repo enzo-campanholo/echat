@@ -22,7 +22,7 @@ typedef struct Node { char *text; size_t size; int queued; int busy; } Node;
 typedef struct View { Ref *v; size_t n, cap, bytes; int shrinking; } View;
 typedef struct Store {
     char *dir;
-    int lockfd;
+    int lockfd, broken; /* storage failure; callers must stop using this store */
     Message *messages;
     unsigned long count;
     size_t mcap;
@@ -65,6 +65,7 @@ void view_free(View *v);
 void view_add(View *v, Ref r);
 void view_copy(View *to, const View *from);
 size_t view_measure(Store *s, View *v);
+/* Render the saved view's prefix, opening a node which crosses end. */
 char *view_render(Store *s, View *v, unsigned long end, int built_only);
 /* Most-due built sibling pair. Age is measured from the pair's last message.
  * max_lines != 0 selects a line budget (used to verify rollback equivalence).

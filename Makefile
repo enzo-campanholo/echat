@@ -43,7 +43,10 @@ tests/engine_test: tests/engine_test.c $(CORE)
 tests/pi_test: tests/pi_test.c src/pi.o src/base.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/pi_test.c src/pi.o src/base.o
 
-test: all tests/base_test tests/store_test tests/view_test tests/fake_pi tests/server_test tests/engine_test tests/pi_test
+tests/fsync_test: tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/pi.c src/main.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Dfsync=unii_test_fsync -Isrc -o $@ tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/pi.c src/main.c
+
+test: all tests/base_test tests/store_test tests/view_test tests/fake_pi tests/fsync_test tests/server_test tests/engine_test tests/pi_test
 	./tests/base_test
 	./tests/store_test
 	./tests/view_test
@@ -71,4 +74,4 @@ install: all
 	cp pi/*.mjs pi/*.ts pi/prompt.txt $(DESTDIR)$(PREFIX)/share/unii/pi/
 
 clean:
-	rm -f unii src/*.o tests/base_test tests/store_test tests/view_test tests/fake_pi tests/server_test tests/engine_test tests/pi_test tests/pi_live_test tests/pi_worker_test tests/pi_failure_test
+	rm -f unii src/*.o tests/base_test tests/store_test tests/view_test tests/fake_pi tests/fsync_test tests/server_test tests/engine_test tests/pi_test tests/pi_live_test tests/pi_worker_test tests/pi_failure_test

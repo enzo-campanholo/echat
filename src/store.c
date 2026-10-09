@@ -45,6 +45,7 @@ static int io_fail(Store *s, const char *what, const char *path)
     Buf b;
     int result, err;
     err = errno;
+    s->broken = 1;
     buf_init(&b);
     buf_puts(&b, what);
     buf_puts(&b, " (");
@@ -1014,8 +1015,10 @@ static Json *message_record(Store *s, unsigned long i)
         else
             json_free(j);
     }
-    if (!result)
+    if (!result) {
+        s->broken = 1;
         fail(s, "indexed message is unreadable or changed", s->messages[i].path);
+    }
     buf_free(&line);
     fclose(f);
     return result;

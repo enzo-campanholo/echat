@@ -92,7 +92,11 @@ int main(void)
                 if (fd >= 0) { close(fd); fail = 1; }
             }
             buf_reset(&summary);
-            if (!strncmp(message, "Too long:", 9))
+            env = getenv("UNII_TEST_SUMMARY_BYTES");
+            if (env) {
+                assert(!strcmp(env, "500"));
+                for (k = 0; k < 500; k++) buf_putc(&summary, 's');
+            } else if (!strncmp(message, "Too long:", 9))
                 buf_puts(&summary, "user: deterministic summary preserving the test's correction and result.");
             else
                 for (k = 0; k < 600; k++) buf_putc(&summary, 'x');

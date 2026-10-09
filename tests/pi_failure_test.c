@@ -232,7 +232,28 @@ static char *setup(const char *project, const char *dir, const char *name)
     set_path("UNII_TEST_PROBE", path, "probe.txt");
     set_path("PI_CODING_AGENT_DIR", path, "pi-config");
     assert(!unsetenv("UNII_TEST_FAIL_ONCE"));
+    assert(!unsetenv("UNII_TEST_ZOOM"));
+    assert(!unsetenv("UNII_TEST_MISSING_LOG"));
     return path;
+}
+
+static char *seed_note(const char *dir)
+{
+    static const char record[] =
+        "{\"i\":0,\"kind\":\"note\",\"text\":\"PRIOR_NOTE\",\"size\":10,"
+        "\"date\":\"2000-01-01T00:00:00Z\"}\n";
+    Store s;
+    char *chat, *log;
+    FILE *f;
+    chat = path_join(dir, "chat");
+    assert(store_open(&s, chat));
+    store_close(&s);
+    log = path_join(chat, "main/2000-01-01.jsonl");
+    free(chat);
+    f = fopen(log, "wb");
+    assert(f && fwrite(record, 1, sizeof(record) - 1, f) == sizeof(record) - 1);
+    assert(!fclose(f));
+    return log;
 }
 
 static void saved_words(const char *dir)
@@ -255,7 +276,8 @@ static void saved_words(const char *dir)
 
 int main(int argc, char **argv)
 {
-    char project[4096], note[1001], *dir, *chat;
+    char project[4096], note[1001], *dir, *chat, *log, *hidden;
+    Buf path;
     Client c;
     Store s;
     assert(argc > 1);
@@ -302,6 +324,27 @@ int main(int argc, char **argv)
     send_prompt(&c, 1, saved_input); accepted(&c, "started");
     settled(&c); stop(&c);
     check_calls(dir, 1, 0); saved_words(dir); free(dir);
-    puts("live Pi failures: stopped input, durable words, rejected NUL, blocked tools OK");
+
+    dir = setup(project, argv[1], "missing-log");
+    log = seed_note(dir);
+    assert(!setenv("UNII_TEST_ZOOM", "missing", 1));
+    assert(!setenv("UNII_TEST_MISSING_LOG", log, 1));
+    c = start(project);
+    send_prompt(&c, 1, saved_input); accepted(&c, "started");
+    settled(&c); stop(&c);
+    check_calls(dir, 1, 0);
+    buf_init(&path); buf_puts(&path, log); buf_puts(&path, ".hidden");
+    hidden = path.s;
+    assert(!rename(hidden, log));
+    buf_free(&path);
+    saved_words(dir); free(log); free(dir);
+
+    dir = setup(project, argv[1], "invalid-zoom");
+    assert(!setenv("UNII_TEST_ZOOM", "range", 1));
+    c = start(project);
+    send_prompt(&c, 1, saved_input); accepted(&c, "started");
+    settled(&c); stop(&c);
+    check_calls(dir, 3, 1); saved_words(dir); free(dir);
+    puts("live Pi failures: durable input, blocked tools, fatal reads, recoverable zoom errors OK");
     return 0;
 }

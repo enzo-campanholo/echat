@@ -31,7 +31,6 @@ typedef struct Server {
     Json *cache_wait;
     int frontend_writing;
     Json *pending;
-    View preceding;
     unsigned long before;
     unsigned long configuration;
     int quitting, fatal;
@@ -59,7 +58,9 @@ static void response(const Json *req, int ok, const char *field, const char *val
         json_dump(&b, id);
     else
         buf_puts(&b, "null");
-    buf_puts(&b, ok ? ",\"ok\":true" : ",\"ok\":false");
+    buf_puts(&b, ok > 0 ? ",\"ok\":true" : ",\"ok\":false");
+    if (ok < 0)
+        buf_puts(&b, ",\"fatal\":true");
     if (field) {
         buf_putc(&b, ',');
         buf_json(&b, field);
@@ -75,6 +76,12 @@ static void response(const Json *req, int ok, const char *field, const char *val
 static void error_response(const Json *req, const char *error)
 {
     response(req, 0, "error", error);
+}
+
+static void storage_error(Server *s, const Json *req)
+{
+    s->fatal = 1;
+    response(req, -1, "error", s->store.error);
 }
 
 static void image_response(const Json *req, const char *text, const char *images)
@@ -196,7 +203,6 @@ static int settle_pending(Server *s)
                 "compaction failed; send a message to retry");
             json_free(req);
             s->pending = NULL;
-            view_free(&s->preceding);
         }
         return 0;
     }
@@ -214,13 +220,12 @@ static int settle_pending(Server *s)
     if (!strcmp(op, "flush")) {
         response(req, 1, NULL, NULL);
     } else {
-        view = view_render(&s->store, &s->preceding, s->before, 1);
+        view = view_render(&s->store, &s->store.view, s->before, 1);
         response(req, 1, "view", view);
         free(view);
     }
     json_free(req);
     s->pending = NULL;
-    view_free(&s->preceding);
     return 0;
 }
 
@@ -282,14 +287,11 @@ static int dispatch(Server *s, Json *req)
             /* Failed calls retry only at an incoming message. No timed retry. */
             engine_retry(&s->engine);
             s->before = s->store.count;
-            /* Capture the preceding view before recording input. Its missing
-             * nodes may finish later; its boundary must never move. */
+            /* Record input before waiting, but retain the preceding boundary.
+             * Rendering follows live batches while opening any crossing node. */
             if (!strcmp(op, "turn")) {
-                view_copy(&s->preceding, &s->store.view);
                 if (append(s, "user", text, json_get(req, "images")) < 0) {
-                    error_response(req, s->store.error);
-                    s->fatal = 1;
-                    view_free(&s->preceding);
+                    storage_error(s, req);
                     json_free(req);
                     return -1;
                 }
@@ -321,8 +323,7 @@ static int dispatch(Server *s, Json *req)
         if (!text || !kind) {
             error_response(req, "append needs kind and text");
         } else if (append(s, kind, text, json_get(req, "images")) < 0) {
-            error_response(req, s->store.error);
-            s->fatal = 1;
+            storage_error(s, req);
         } else {
             buf_init(&b);
             buf_ulong(&b, first);
@@ -331,18 +332,23 @@ static int dispatch(Server *s, Json *req)
         }
     } else if (!strcmp(op, "zoom") || !strcmp(op, "date")) {
         j = json_get(req, "args");
-        text = memory(s, op, j ? j : req);
-        if (!text) error_response(req, s->store.error);
+        if (!j) j = req;
+        text = memory(s, op, j);
+        if (!text) {
+            if (s->store.broken) storage_error(s, req);
+            else error_response(req, s->store.error);
+        }
         else {
             images = NULL;
             n = 1;
             page = 0;
-            if (!strcmp(op, "zoom") && j &&
+            if (!strcmp(op, "zoom") &&
                 json_ulong(json_get(j, "id"), &id) &&
                 (!json_get(j, "n") || json_ulong(json_get(j, "n"), &n)) && n == 1 &&
                 (!json_get(j, "page") || json_ulong(json_get(j, "page"), &page)) && !page)
                 images = store_images(&s->store, id);
-            image_response(req, text, images);
+            if (s->store.broken) storage_error(s, req);
+            else image_response(req, text, images);
             free(images);
             free((char *)text);
         }
@@ -355,7 +361,7 @@ static int dispatch(Server *s, Json *req)
         error_response(req, "unknown operation");
     }
     json_free(req);
-    return 0;
+    return s->fatal ? -1 : 0;
 }
 
 static int consume(Server *s)
@@ -390,6 +396,8 @@ static int consume(Server *s)
             return -1;
         } else if (dispatch(s, req) < 0)
             return -1;
+        if (s->quitting)
+            break;
     }
     if (used) {
         memmove(s->input.s, s->input.s + used, s->input.len - used);
@@ -575,7 +583,6 @@ static int serve(Server *s)
         free(s->workers[k].shortest);
     }
     json_free(s->pending);
-    view_free(&s->preceding);
     json_free(s->cache_wait);
     buf_free(&s->input);
     free(s->system);

@@ -3,12 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
 typedef struct Client { FILE *in, *out; pid_t pid; unsigned long serial; } Client;
 
-static Client start(const char *dir)
+static Client start_binary(const char *dir, const char *binary)
 {
     int in[2], out[2];
     Client c;
@@ -18,7 +19,7 @@ static Client start(const char *dir)
     if (!c.pid) {
         assert(dup2(in[0], 0) >= 0 && dup2(out[1], 1) >= 0);
         close(in[0]); close(in[1]); close(out[0]); close(out[1]);
-        execl("./unii", "unii", "serve", dir, "--pi", "./tests/fake_pi", (char *)NULL);
+        execl(binary, "unii", "serve", dir, "--pi", "./tests/fake_pi", (char *)NULL);
         _exit(127);
     }
     close(in[0]); close(out[1]);
@@ -27,6 +28,11 @@ static Client start(const char *dir)
     c.serial = 0;
     assert(c.in && c.out);
     return c;
+}
+
+static Client start(const char *dir)
+{
+    return start_binary(dir, "./unii");
 }
 
 static void send(Client *c, const char *op, const char *kind, const char *text)
@@ -140,6 +146,94 @@ static void invalid_protocol(const char *root)
     free(dir);
 }
 
+static void fatal_storage(const char *root)
+{
+    static const char first[] = "FIRST_RECORD_SURVIVES_FAILED_SYNC";
+    Client c;
+    char date[32], *dir, *log;
+    time_t now;
+    struct tm utc;
+    FILE *f;
+    Buf line;
+    Json *j;
+    unsigned long id, count;
+    int status;
+    dir = path_join(root, "fatal-storage");
+    now = time(NULL);
+    assert(now != (time_t)-1 && gmtime_r(&now, &utc));
+    assert(strftime(date, sizeof(date), "main/%Y-%m-%d.jsonl", &utc));
+    log = path_join(dir, date);
+    assert(!setenv("UNII_TEST_FSYNC_PATH", log, 1));
+    c = start_binary(dir, "./tests/fsync_test");
+    assert(!unsetenv("UNII_TEST_FSYNC_PATH"));
+    /* Both records arrive in one buffered batch. A failed write must end it. */
+    send(&c, "append", "user", first);
+    send(&c, "append", "user", "SECOND_RECORD_MUST_NEVER_BE_DISPATCHED");
+    assert(!fflush(c.out));
+    j = receive(&c);
+    assert(json_str(json_get(j, "error")));
+    json_free(j);
+    buf_init(&line);
+    assert(read_line(c.in, &line) == 0);
+    assert(!fclose(c.in) && !fclose(c.out));
+    assert(waitpid(c.pid, &status, 0) == c.pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    f = fopen(log, "rb");
+    assert(f && read_line(f, &line) == 1);
+    j = json_parse(line.s);
+    assert(j && json_ulong(json_get(j, "i"), &id) && id == 0);
+    assert(!strcmp(json_str(json_get(j, "text")), first));
+    json_free(j);
+    assert(read_line(f, &line) == 0 && !fclose(f));
+    buf_free(&line);
+    /* The completed crash tail remains recoverable with its original id. */
+    c = start(dir);
+    j = request(&c, "status", NULL, NULL);
+    assert(json_ulong(json_get(j, "messages"), &count) && count == 1);
+    ok(j);
+    stop(&c);
+    free(dir); free(log);
+}
+
+static void backlog(const char *root, const char *source)
+{
+    Client c;
+    char *dir, *p, *end;
+    const char *view;
+    Json *j;
+    unsigned long id, n, covered;
+    int k;
+    dir = path_join(root, "backlog");
+    assert(!setenv("UNII_TEST_SUMMARY_BYTES", "500", 1));
+    c = start(dir);
+    assert(!unsetenv("UNII_TEST_SUMMARY_BYTES"));
+    for (k = 0; k < 500; k++)
+        ok(request(&c, "append", "note", source));
+    send(&c, "configure", NULL, "fixed system");
+    send(&c, "turn", NULL, "NEW_INPUT_AFTER_LARGE_BACKLOG");
+    assert(!fflush(c.out));
+    ok(receive(&c));
+    j = receive(&c);
+    view = json_str(json_get(j, "view"));
+    assert(view && strlen(view) <= 128000);
+    assert(!strstr(view, "not summarized yet") && !strstr(view, "NEW_INPUT"));
+    covered = 0;
+    for (p = (char *)view + 7; *p != '<'; p = end + 1) {
+        id = strtoul(p, &end, 10);
+        assert(end != p && *end == '+');
+        n = strtoul(end + 1, &end, 10);
+        assert(*end == '|' && n && !(n & (n - 1)));
+        assert(id == covered && !(id % n) && n <= 500 - covered);
+        covered += n;
+        end = strchr(end, '\n');
+        assert(end);
+    }
+    assert(covered == 500 && !strcmp(p, "</chat>\n"));
+    ok(j);
+    stop(&c);
+    free(dir);
+}
+
 int main(int argc, char **argv)
 {
     Client c;
@@ -181,6 +275,8 @@ int main(int argc, char **argv)
     stop(&c);
     failed_input(argv[1], text);
     invalid_protocol(argv[1]);
+    fatal_storage(argv[1]);
+    backlog(argv[1], text);
     c = start(argv[1]);
     ok(request(&c, "configure", NULL, "fixed system"));
     after = read_file(path);

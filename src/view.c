@@ -55,22 +55,40 @@ static void line(Buf *b, Ref r, const Node *n)
     buf_putc(b, '\n');
 }
 
+/* Open only the node crossing the cutoff. Its children already exist; this
+ * preserves the saved view's merges and never exposes a later message. */
+static int prefix_line(Store *s, Buf *b, Ref r, unsigned long end, int built_only)
+{
+    Node *n;
+    Ref child;
+    unsigned long start;
+    start = ref_start(r);
+    if (start >= end)
+        return 0;
+    if (ref_span(r) > end - start) {
+        child.l = r.l - 1;
+        child.i = r.i * 2;
+        if (!prefix_line(s, b, child, end, built_only))
+            return 0;
+        child.i++;
+        return prefix_line(s, b, child, end, built_only);
+    }
+    n = store_node(s, r);
+    if (!n && built_only)
+        return 0;
+    line(b, r, n);
+    return 1;
+}
+
 char *view_render(Store *s, View *v, unsigned long end, int built_only)
 {
     Buf b;
     size_t i;
-    Node *n;
-    Ref r;
     buf_init(&b);
     buf_puts(&b, "<chat>\n");
     for (i = 0; i < v->n; i++) {
-        r = v->v[i];
-        if (ref_start(r) >= end || ref_span(r) > end - ref_start(r))
+        if (!prefix_line(s, &b, v->v[i], end, built_only))
             break;
-        n = store_node(s, r);
-        if (!n && built_only)
-            break;
-        line(&b, r, n);
     }
     buf_puts(&b, "</chat>\n");
     return b.s;

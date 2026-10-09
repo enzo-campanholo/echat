@@ -238,7 +238,6 @@ int engine_sync(Engine *e)
         view_add(&e->compact, r);
     }
     if (added) {
-        e->epoch++;
         engine_retry(e);
         if (update_views(e) < 0 || save_compact(e) < 0)
             return -1;
@@ -410,43 +409,11 @@ char *engine_task(Engine *e, Job j)
     return b.s;
 }
 
-static void context_add(Store *s, View *v, Ref r, unsigned long end)
-{
-    Ref child;
-    unsigned long start, span;
-    start = ref_start(r);
-    span = ref_span(r);
-    if (start >= end)
-        return;
-    if (span <= end - start) {
-        view_add(v, r);
-        return;
-    }
-    if (!r.l)
-        return;
-    child.l = r.l - 1;
-    child.i = r.i * 2;
-    context_add(s, v, child, end);
-    child.i++;
-    context_add(s, v, child, end);
-}
-
 char *engine_context(Engine *e, Job j)
 {
-    View prefix;
-    size_t i;
-    char *text;
     unsigned long end;
-    view_init(&prefix);
     end = ref_start(j.ref) + (j.ref.l ? ref_span(j.ref) : 0);
-    for (i = 0; i < e->compact.n; i++) {
-        if (ref_start(e->compact.v[i]) >= end)
-            break;
-        context_add(e->store, &prefix, e->compact.v[i], end);
-    }
-    text = view_render(e->store, &prefix, end, 1);
-    view_free(&prefix);
-    return text;
+    return view_render(e->store, &e->compact, end, 1);
 }
 
 int engine_caught_up(Engine *e, unsigned long before)

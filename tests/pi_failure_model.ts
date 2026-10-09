@@ -1,5 +1,5 @@
 /* Actual Pi hooks and tool execution, with an entirely local provider. */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, renameSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 export default function (pi: any) {
@@ -22,6 +22,7 @@ export default function (pi: any) {
     streamSimple(model: any, context: any, options: any) {
       const stream = createAssistantMessageEventStream();
       const call = calls++;
+      const zoom = process.env.UNII_TEST_ZOOM;
       appendFileSync(process.env.UNII_TEST_PROVIDER_LOG!, JSON.stringify({ call, messages: context.messages }) + "\n");
       const output: any = {
         role: "assistant", api: model.api, provider: model.provider,
@@ -35,6 +36,10 @@ export default function (pi: any) {
         try {
           await options?.onPayload?.({ model: model.id, messages: context.messages }, model);
           if (options?.signal?.aborted) throw new Error("aborted");
+          if (!call && zoom === "missing") {
+            const path = process.env.UNII_TEST_MISSING_LOG!;
+            renameSync(path, path + ".hidden");
+          }
           await options?.onResponse?.({
             url: "https://offline.invalid", status: 200, statusText: "OK", headers: new Headers(),
           }, model);
@@ -46,14 +51,17 @@ export default function (pi: any) {
           output.content[0].text = text;
           stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
           stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
-          if (!call) {
-            const toolCall = { type: "toolCall", id: "failure-probe", name: "probe", arguments: {} };
+          const hasTool = zoom ? call < 2 : !call;
+          if (hasTool) {
+            const name = zoom && !call ? "zoom" : "probe";
+            const args = name === "zoom" ? { id: zoom === "range" ? 99999 : 0, n: 1 } : {};
+            const toolCall = { type: "toolCall", id: "failure-" + call, name, arguments: args };
             output.content.push(toolCall);
             stream.push({ type: "toolcall_start", contentIndex: 1, partial: output });
-            stream.push({ type: "toolcall_delta", contentIndex: 1, delta: "{}", partial: output });
+            stream.push({ type: "toolcall_delta", contentIndex: 1, delta: JSON.stringify(args), partial: output });
             stream.push({ type: "toolcall_end", contentIndex: 1, toolCall, partial: output });
           }
-          output.stopReason = call ? "stop" : "toolUse";
+          output.stopReason = hasTool ? "toolUse" : "stop";
           stream.push({ type: "done", reason: output.stopReason, message: output });
         } catch (error) {
           output.stopReason = options?.signal?.aborted ? "aborted" : "error";
