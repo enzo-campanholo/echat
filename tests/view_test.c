@@ -1,8 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
 #include "engine.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct Rollback { unsigned long start[64]; int keep[64]; size_t n; } Rollback;
 
@@ -24,16 +26,41 @@ static void push(Rollback *r, unsigned long state, size_t at)
     }
 }
 
+static FILE *tree_log; /* scratch log holding the test nodes' records */
+static char *tree_path;
+
+/* A built node is a record in a log, read back on demand like the store's. */
+static void put(Store *s, Ref r, const char *text)
+{
+    Buf b;
+    Node *n;
+    long at;
+    assert(!fseek(tree_log, 0, SEEK_END) && (at = ftell(tree_log)) >= 0);
+    buf_init(&b);
+    buf_puts(&b, "{\"l\":");
+    buf_ulong(&b, r.l);
+    buf_puts(&b, ",\"i\":");
+    buf_ulong(&b, r.i);
+    buf_puts(&b, ",\"text\":");
+    buf_json(&b, text);
+    buf_puts(&b, ",\"size\":");
+    buf_ulong(&b, (unsigned long)strlen(text));
+    buf_puts(&b, "}\n");
+    assert(fwrite(b.s, 1, b.len, tree_log) == b.len && !fflush(tree_log));
+    buf_free(&b);
+    n = store_slot(s, r);
+    n->offset = (off_t)at;
+    n->file = store_file(s, tree_path);
+    n->size = (unsigned int)strlen(text);
+}
+
 static void build(Store *s, unsigned long id, const char *text)
 {
     Ref r, sibling;
-    Node *n;
     r.l = 0;
     r.i = id;
     for (;;) {
-        n = store_slot(s, r);
-        n->text = xstrdup(text);
-        n->size = strlen(text);
+        put(s, r, text);
         sibling = r;
         sibling.i ^= 1;
         if (!store_node(s, sibling))
@@ -44,19 +71,6 @@ static void build(Store *s, unsigned long id, const char *text)
             break;
     }
 }
-
-static void clear(Store *s)
-{
-    size_t i;
-    unsigned int l;
-    for (l = 0; l < TREE_LEVELS; l++) {
-        for (i = 0; i < s->capacities[l]; i++)
-            free(s->levels[l][i].text);
-        free(s->levels[l]);
-    }
-    view_free(&s->view);
-}
-
 static void equivalence(void)
 {
     Store s;
@@ -87,7 +101,7 @@ static void equivalence(void)
         }
         assert(end == s.count);
     }
-    clear(&s);
+    store_close(&s);
 }
 
 static void sawtooth(void)
@@ -118,25 +132,24 @@ static void sawtooth(void)
             batches++;
         } else {
             assert(s.view.n == oldn + 1);
-            now = view_render(&s, &s.view, s.count, 0);
+            now = view_render(&s, &s.view, s.count, 0, 0);
             /* Closing tags move; all previous summary bytes remain a prefix. */
             assert(!strncmp(old, now, strlen(old) - (strlen(old) >= 8 ? 8 : 0)));
             free(now);
         }
         free(old);
-        old = view_render(&s, &s.view, s.count, 0);
+        old = view_render(&s, &s.view, s.count, 0, 0);
         assert(s.view.bytes == strlen(old));
     }
     assert(batches > 10);
     free(old);
-    clear(&s);
+    store_close(&s);
 }
 
 static void availability(void)
 {
     Store s;
     Ref a, b, p;
-    Node *n;
     memset(&s, 0, sizeof(s));
     s.count = 2;
     a.l = b.l = 0;
@@ -148,14 +161,12 @@ static void availability(void)
     assert(s.view.shrinking && s.view.n == 2);
     p.l = 1;
     p.i = 0;
-    n = store_slot(&s, p);
-    n->text = xstrdup("user: short");
-    n->size = strlen(n->text);
+    put(&s, p, "user: short");
     assert(view_shrink(&s, &s.view, 128000, 64000, 0) == 0);
     assert(!s.view.shrinking); /* already below low budget */
     assert(view_shrink(&s, &s.view, 0, 0, 1));
     assert(s.view.n == 1 && s.view.v[0].l == 1);
-    clear(&s);
+    store_close(&s);
 }
 
 static void cutoff(void)
@@ -171,7 +182,7 @@ static void cutoff(void)
     r.l = 4; r.i = 0;
     view_add(&s.view, r);
     for (cut = 0; cut <= s.count; cut++) {
-        text = view_render(&s, &s.view, cut, 1);
+        text = view_render(&s, &s.view, cut, 1, 0);
         covered = 0;
         for (p = text + 7; *p != '<'; p = end + 1) {
             id = strtoul(p, &end, 10);
@@ -184,22 +195,29 @@ static void cutoff(void)
             assert(end);
         }
         assert(covered == cut && !strcmp(p, "</chat>\n"));
-        bounded = view_render_limit(&s, &s.view, cut, 1, strlen(text));
+        bounded = view_render(&s, &s.view, cut, 1, strlen(text));
         assert(bounded && !strcmp(text, bounded));
         free(bounded);
-        assert(!view_render_limit(&s, &s.view, cut, 1, strlen(text) - 1));
+        assert(!view_render(&s, &s.view, cut, 1, strlen(text) - 1));
         free(text);
     }
     assert(s.view.n == 1 && s.view.v[0].l == 4);
-    clear(&s);
+    store_close(&s);
 }
 
 int main(void)
 {
+    char dir[] = "/tmp/uniichat-view-XXXXXX";
+    assert(mkdtemp(dir));
+    tree_path = path_join(dir, "tree.jsonl");
+    tree_log = fopen(tree_path, "ab");
+    assert(tree_log);
     equivalence();
     sawtooth();
     availability();
     cutoff();
+    assert(!fclose(tree_log) && !unlink(tree_path) && !rmdir(dir));
+    free(tree_path);
     puts("view: rollback equivalence through 20,000 pushes; byte sawtooth; availability OK");
     return 0;
 }

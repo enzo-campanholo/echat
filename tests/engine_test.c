@@ -71,6 +71,28 @@ static void put_file(const char *dir, const char *name, const char *text)
     free(p);
 }
 
+static int add(Store *s, const char *kind, const char *text)
+{
+    Entry e;
+    e.kind = kind;
+    e.text = text;
+    e.images = NULL;
+    return store_append(s, &e, 1, NULL, NULL);
+}
+
+/* A built node's text, read back from the log, is A followed by B. */
+static int node_is(Store *s, Ref r, const char *a, const char *b)
+{
+    char *text;
+    int same;
+    text = store_text(s, r);
+    assert(text);
+    same = strlen(text) == strlen(a) + strlen(b) && !strncmp(text, a, strlen(a)) &&
+           !strcmp(text + strlen(a), b);
+    free(text);
+    return same;
+}
+
 static Ref ref(unsigned int l, unsigned long i)
 {
     Ref r;
@@ -105,19 +127,18 @@ static void shortcuts_and_tasks(void)
     char *dir, *short_text, *long_text, *task;
     Node *n;
     dir = new_dir();
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     short_text = repeated(506, 'a');
     long_text = repeated(507, 'b');
-    assert(store_append(&s, "user", short_text, NULL, NULL));
-    assert(store_append(&s, "unii", long_text, NULL, NULL));
-    assert(store_append(&s, "note", "small", NULL, NULL));
+    assert(!add(&s, "user", short_text));
+    assert(!add(&s, "unii", long_text));
+    assert(!add(&s, "note", "small"));
     assert(engine_open(&e, &s) == 0);
     assert(engine_next(&e, &j) == 1);
     check_job(j, 0, 1);
     n = store_node(&s, ref(0, 0));
     assert(n && n->size == NODE_BYTES);
-    assert(!memcmp(n->text, "user: ", 6));
-    assert(!strcmp(n->text + 6, short_text));
+    assert(node_is(&s, ref(0, 0), "user: ", short_text));
     assert(!store_node(&s, ref(1, 0)));
     task = engine_task(&e, j);
     assert(task && strstr(task, "Compaction: compress message 1 "));
@@ -136,7 +157,7 @@ static void shortcuts_and_tasks(void)
     assert(engine_done(&e, j, "user requested a; unii replied b") == 0);
     assert(engine_next(&e, &j) == 0);
     n = store_node(&s, ref(0, 2));
-    assert(n && !strcmp(n->text, "note: small"));
+    assert(n && node_is(&s, ref(0, 2), "note: small", ""));
     assert(engine_caught_up(&e, 3));
     assert(!engine_caught_up(&e, 4));
     engine_close(&e);
@@ -159,9 +180,9 @@ static void sibling_shortcuts_once(void)
     unsigned long i;
     Node *n;
     dir = new_dir();
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     for (i = 0; i < 16; i++)
-        assert(store_append(&s, "user", "x", NULL, NULL));
+        assert(!add(&s, "user", "x"));
     assert(engine_open(&e, &s) == 0);
     assert(engine_next(&e, &j) == 0);
     assert(e.inflight == 0 && e.contiguous == 16);
@@ -174,7 +195,7 @@ static void sibling_shortcuts_once(void)
         }
     }
     n = store_node(&s, ref(1, 0));
-    assert(!strcmp(n->text, "user: x\nuser: x"));
+    assert(node_is(&s, ref(1, 0), "user: x\nuser: x", ""));
     path = path_join(dir, "tree");
     {
         DIR *d;
@@ -196,7 +217,7 @@ static void sibling_shortcuts_once(void)
     }
     engine_close(&e);
     store_close(&s);
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     assert(engine_open(&e, &s) == 0);
     assert(engine_next(&e, &j) == 0);
     assert(e.contiguous == 16);
@@ -238,10 +259,10 @@ static void predecessor_window_and_retry(void)
     size_t k;
     int rc;
     dir = new_dir();
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     long_text = repeated(600, 'q');
     for (i = 0; i < 16; i++)
-        assert(store_append(&s, "user", long_text, NULL, NULL));
+        assert(!add(&s, "user", long_text));
     assert(engine_open(&e, &s) == 0);
     for (k = 0; k < WORKERS; k++) {
         assert(engine_next(&e, &jobs[k]) == 1);
@@ -249,7 +270,7 @@ static void predecessor_window_and_retry(void)
     }
     assert(e.inflight == WORKERS);
     assert(engine_next(&e, &j) == 0);
-    engine_fail(&e, jobs[0]);
+    engine_fail(&e, jobs[0], 0);
     assert(e.inflight == WORKERS);
     assert(engine_next(&e, &j) == 0);
     for (k = 1; k < WORKERS; k++)
@@ -268,7 +289,7 @@ static void predecessor_window_and_retry(void)
     /* Synchronizing without a new message must not retry failed work. */
     assert(engine_sync(&e) == 0);
     assert(engine_next(&e, &j) == 0);
-    assert(store_append(&s, "note", "immediate new message", NULL, NULL));
+    assert(!add(&s, "note", "immediate new message"));
     assert(engine_sync(&e) == 0);
     assert(engine_next(&e, &retry) == 1);
     check_job(retry, 0, 0);
@@ -290,8 +311,8 @@ static void predecessor_window_and_retry(void)
     } while (rc == 1);
     assert(e.contiguous == 17 && e.inflight == 0);
     assert(engine_caught_up(&e, 17));
-    assert(!strcmp(store_node(&s, ref(0, 16))->text,
-                   "note: immediate new message"));
+    assert(node_is(&s, ref(0, 16),
+                   "note: immediate new message", ""));
     engine_close(&e);
     store_close(&s);
     free(long_text);
@@ -314,9 +335,9 @@ static void parent_jobs_once(void)
     message = repeated(600, 'm');
     summary = repeated(400, 's');
     memset(seen, 0, sizeof(seen));
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     for (i = 0; i < 8; i++)
-        assert(store_append(&s, "user", message, NULL, NULL));
+        assert(!add(&s, "user", message));
     assert(engine_open(&e, &s) == 0);
     total = 0;
     for (;;) {
@@ -342,7 +363,7 @@ static void parent_jobs_once(void)
     assert(store_node(&s, ref(3, 0)));
     engine_close(&e);
     store_close(&s);
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     assert(engine_open(&e, &s) == 0);
     assert(engine_next(&e, &j) == 0);
     engine_close(&e);
@@ -363,9 +384,9 @@ static void context_boundaries_and_persistence(void)
     unsigned long i;
     size_t k;
     dir = new_dir();
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     for (i = 0; i < 8; i++)
-        assert(store_append(&s, "user", "x", NULL, NULL));
+        assert(!add(&s, "user", "x"));
     assert(engine_open(&e, &s) == 0);
     assert(engine_next(&e, &j) == 0);
     view_init(&original);
@@ -396,11 +417,11 @@ static void context_boundaries_and_persistence(void)
            "<chat>\n0+4|user: x user: x user: x user: x\n</chat>\n"));
     free(context);
     /* Message 8 is missing; message 9 built out of order must not appear. */
-    assert(store_append(&s, "note", "missing", NULL, NULL));
-    assert(store_append(&s, "note", "later", NULL, NULL));
-    assert(store_append(&s, "note", "target", NULL, NULL));
+    assert(!add(&s, "note", "missing"));
+    assert(!add(&s, "note", "later"));
+    assert(!add(&s, "note", "target"));
     assert(engine_sync(&e) == 0);
-    assert(store_build(&s, ref(0, 9), "note: later"));
+    assert(!store_build(&s, ref(0, 9), "note: later"));
     j.ref = ref(0, 10);
     context = engine_context(&e, j);
     assert(context && !strstr(context, "missing") && !strstr(context, "later"));
@@ -409,7 +430,7 @@ static void context_boundaries_and_persistence(void)
     free(context);
     engine_close(&e);
     store_close(&s);
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     assert(engine_open(&e, &s) == 0);
     assert(e.compact.n == 5 && e.compact.v[0].l == 2 &&
            e.compact.v[2].i == 8 && e.compact.v[3].i == 9 &&
@@ -430,8 +451,8 @@ static void rejected_compaction_view(void)
     Engine e;
     char *dir, *saved, *after;
     dir = new_dir();
-    assert(store_open(&s, dir));
-    assert(store_append(&s, "user", "x", NULL, NULL));
+    assert(!store_open(&s, dir));
+    assert(!add(&s, "user", "x"));
     put_file(dir, "compaction-view.json", "{\"shrinking\":0,\"view\":[[0,1]]}\n");
     saved = get_file(dir, "compaction-view.json");
     assert(engine_open(&e, &s) == -1);
@@ -453,12 +474,12 @@ static void unbuilt_compaction_parent(void)
     char *dir, *saved, *after, summary[501];
     unsigned long i;
     dir = new_dir();
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     memset(summary, 's', sizeof(summary) - 1);
     summary[sizeof(summary) - 1] = 0;
     for (i = 0; i < 4; i++) {
-        assert(store_append(&s, "note", "source", NULL, NULL));
-        assert(store_build(&s, ref(0, i), summary));
+        assert(!add(&s, "note", "source"));
+        assert(!store_build(&s, ref(0, i), summary));
     }
     put_file(dir, "compaction-view.json", "{\"shrinking\":0,\"view\":[[2,0]]}\n");
     saved = get_file(dir, "compaction-view.json");
@@ -483,13 +504,13 @@ static void bounded_compaction_jobs(int long_leaves)
     unsigned long i, calls;
     int next;
     dir = new_dir();
-    assert(store_open(&s, dir));
+    assert(!store_open(&s, dir));
     assert(!engine_open(&e, &s));
     memset(source, 's', sizeof(source) - 1);
     source[long_leaves ? 1000 : 500] = 0;
     memset(summary, 's', 500); summary[500] = 0;
     for (i = 0; i < 500; i++)
-        assert(store_append(&s, "note", source, NULL, NULL));
+        assert(!add(&s, "note", source));
     assert(!engine_sync(&e));
     calls = 0;
     while ((next = engine_next(&e, &j)) == 1) {
@@ -497,7 +518,7 @@ static void bounded_compaction_jobs(int long_leaves)
         assert(context && strlen(context) <= COMPACT_HIGH);
         free(context);
         if (j.ref.l)
-            engine_fail(&e, j);
+            engine_fail(&e, j, 0);
         else {
             assert(long_leaves);
             assert(!engine_done(&e, j, summary));
@@ -520,7 +541,7 @@ static void bounded_compaction_jobs(int long_leaves)
     }
     /* Successful earlier parents release deferred jobs. The next message
      * retries real failures, without losing or double-counting blocked work. */
-    assert(store_append(&s, "user", "retry", NULL, NULL));
+    assert(!add(&s, "user", "retry"));
     assert(!engine_sync(&e));
     calls = 0;
     while ((next = engine_next(&e, &j)) == 1) {
@@ -539,8 +560,99 @@ static void bounded_compaction_jobs(int long_leaves)
     free(dir);
 }
 
+/* Shortest-of-five can still be huge: the ceiling keeps contexts bounded. */
+static void oversized_summaries(void)
+{
+    Store s;
+    Engine e;
+    Job j;
+    Buf huge;
+    char *dir, *source, *within, *over;
+    Node *n;
+    size_t k;
+    dir = new_dir();
+    assert(!store_open(&s, dir));
+    source = repeated(600, 'q');
+    for (k = 0; k < 2; k++)
+        assert(!add(&s, "user", source));
+    assert(engine_open(&e, &s) == 0);
+    buf_init(&huge);
+    buf_putc(&huge, 'a');
+    for (k = 0; k < 20000; k++)
+        buf_puts(&huge, "\xc3\xa9");
+    assert(engine_next(&e, &j) == 1);
+    check_job(j, 0, 0);
+    assert(engine_done(&e, j, huge.s) == 0);
+    n = store_node(&s, ref(0, 0));
+    assert(n && n->size == NODE_BYTES - 1);
+    huge.s[NODE_BYTES - 1] = 0; /* the cut keeps whole code points */
+    assert(node_is(&s, ref(0, 0), huge.s, ""));
+    within = repeated(NODE_BYTES + NODE_SLACK, 'w');
+    assert(engine_next(&e, &j) == 1);
+    check_job(j, 0, 1);
+    assert(engine_done(&e, j, within) == 0);
+    n = store_node(&s, ref(0, 1));
+    assert(n && node_is(&s, ref(0, 1), within, "")); /* a few bytes over is kept */
+    over = repeated(NODE_BYTES + NODE_SLACK + 1, 'o');
+    assert(engine_next(&e, &j) == 1);
+    check_job(j, 1, 0);
+    assert(engine_done(&e, j, over) == 0);
+    n = store_node(&s, ref(1, 0));
+    assert(n && n->size == NODE_BYTES);
+    engine_close(&e);
+    store_close(&s);
+    buf_free(&huge);
+    free(source);
+    free(within);
+    free(over);
+    remove_dir(dir);
+    free(dir);
+}
+
+/* Failed nodes retry after 15, 60 and 300 s, then wait for a message or an
+ * explicit retry, which restarts the schedule (B5). */
+static void automatic_retries(void)
+{
+    Store s;
+    Engine e;
+    Job j;
+    char *dir, *source;
+    dir = new_dir();
+    assert(!store_open(&s, dir));
+    source = repeated(600, 'r');
+    assert(!add(&s, "user", source));
+    assert(engine_open(&e, &s) == 0);
+    assert(engine_deadline(&e, 0) == -1);
+    assert(engine_next(&e, &j) == 1 && e.inflight == 1);
+    engine_fail(&e, j, 1000);
+    assert(engine_deadline(&e, 1000) == 15 && engine_deadline(&e, 2000) == 0);
+    assert(!engine_tick(&e, 1014) && engine_next(&e, &j) == 0);
+    assert(engine_tick(&e, 1015) == 1 && engine_next(&e, &j) == 1 && j.fails == 1);
+    engine_fail(&e, j, 1015);
+    assert(engine_deadline(&e, 1015) == 60);
+    assert(!engine_tick(&e, 1074) && engine_tick(&e, 1075) == 1);
+    assert(engine_next(&e, &j) == 1 && j.fails == 2);
+    engine_fail(&e, j, 1075);
+    assert(engine_deadline(&e, 1075) == 300 && engine_tick(&e, 1375) == 1);
+    assert(engine_next(&e, &j) == 1);
+    engine_fail(&e, j, 1375);
+    assert(engine_deadline(&e, 1375) == -1 && !engine_tick(&e, 999999));
+    assert(engine_next(&e, &j) == 0 && e.failed.n - e.failed.head == 1);
+    engine_retry(&e);
+    assert(engine_next(&e, &j) == 1 && j.fails == 0 && e.inflight == 1);
+    assert(engine_done(&e, j, "user: done") == 0);
+    assert(e.contiguous == 1 && !e.inflight && engine_deadline(&e, 0) == -1);
+    engine_close(&e);
+    store_close(&s);
+    free(source);
+    remove_dir(dir);
+    free(dir);
+}
+
 int main(void)
 {
+    automatic_retries();
+    oversized_summaries();
     shortcuts_and_tasks();
     sibling_shortcuts_once();
     predecessor_window_and_retry();

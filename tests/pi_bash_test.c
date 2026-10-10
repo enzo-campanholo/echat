@@ -27,8 +27,18 @@ static void timeout_handler(int sig)
     static const char text[] = "Pi native shell test exceeded 45 seconds\n";
     (void)sig;
     if (running > 0) kill(-running, SIGKILL);
-    write(2, text, sizeof(text) - 1);
+    if (write(2, text, sizeof(text) - 1) < 0)
+        _exit(125);
     _exit(124);
+}
+
+static int add_note(Store *s, const char *text)
+{
+    Entry e;
+    e.kind = "note";
+    e.text = text;
+    e.images = NULL;
+    return !store_append(s, &e, 1, NULL, NULL);
 }
 
 static void set_path(const char *name, const char *dir, const char *file)
@@ -45,7 +55,7 @@ static char *setup(const char *project, const char *root, const char *name, int 
     dir = path_join(root, name); assert(!mkdirs(dir));
     set_path("UNII_BIN", project, fail ? "tests/pi_failure_test" : "unii");
     set_path("UNII_TEST_REAL_BIN", project, "unii");
-    set_path("UNII_PI", project, "tests/fake_pi");
+    assert(!setenv("UNII_PROVIDER", "unii-summary", 1) && !setenv("UNII_MODEL", "deterministic", 1));
     set_path("UNII_DIR", dir, "chat");
     set_path("UNII_TEST_WORKER_LOG", dir, "provider.jsonl");
     set_path("UNII_TEST_BLOCKED_MARKER", dir, "executed");
@@ -58,9 +68,10 @@ static Client start(const char *project)
 {
     Client c;
     int input[2], output[2];
-    char *extension, *provider;
+    char *extension, *provider, *summary;
     extension = path_join(project, "pi/unii.ts");
     provider = path_join(project, "tests/pi_worker_model.ts");
+    summary = path_join(project, "tests/pi_summary_model.ts");
     assert(!pipe(input) && !pipe(output));
     c.pid = fork(); assert(c.pid >= 0);
     if (!c.pid) {
@@ -70,14 +81,14 @@ static Client start(const char *project)
         execlp("pi", "pi", "--mode", "rpc", "--no-session", "--offline",
                "--no-extensions", "--no-skills", "--no-prompt-templates",
                "--no-context-files", "--no-mcp", "--no-approve",
-               "--extension", extension, "--extension", provider,
+               "--extension", extension, "--extension", provider, "--extension", summary,
                "--provider", "unii-worker-test", "--model", "deterministic",
                "--tools", "zoom,date", (char *)NULL);
         _exit(127);
     }
     close(input[0]); close(output[1]);
     c.in = fdopen(output[0], "r"); c.out = fdopen(input[1], "w");
-    assert(c.in && c.out); free(extension); free(provider);
+    assert(c.in && c.out); free(extension); free(provider); free(summary);
     running = c.pid; alarm(45);
     return c;
 }
@@ -169,16 +180,16 @@ static void memory(const char *dir)
     unsigned long i;
     size_t k, chars;
     int commands, echoes, calls;
-    path = path_join(dir, "chat"); assert(store_open(&s, path)); free(path);
+    path = path_join(dir, "chat"); assert(!store_open(&s, path)); free(path);
     assert(s.count == 8);
     commands = echoes = 0;
     for (i = 0; i < s.count; i++) {
         text = store_message(&s, i); assert(text);
         assert(!strstr(text, "EXCLUDED_SHELL_RESULT"));
-        if (!strcmp(text, short_command) || !strcmp(text, long_command)) {
-            assert(!strcmp(s.messages[i].kind, "user")); commands++;
+        if (text[0] == '!' && (!strcmp(text + 1, short_command) || !strcmp(text + 1, long_command))) {
+            assert(!strcmp(store_kind(&s, i), "user")); commands++;
         }
-        if (!strcmp(s.messages[i].kind, "echo")) {
+        if (!strcmp(store_kind(&s, i), "echo")) {
             echoes++;
             assert(strstr(text, "cancelled=false"));
             if (strstr(text, "exit=7")) {
@@ -254,9 +265,9 @@ static void failed_result(const char *project, const char *root)
     j = request(&c, 3, "prompt", "MUST_NOT_CONTINUE_AFTER_LOST_RESULT", 0);
     success(j, 1); assert(!strcmp(json_str(json_get(json_get(j, "data"), "disposition")), "handled"));
     json_free(j); stop(&c); assert(!lines(dir));
-    chat = path_join(dir, "chat"); assert(store_open(&s, chat)); free(chat);
-    assert(s.count == 1 && !strcmp(s.messages[0].kind, "user"));
-    text = store_message(&s, 0); assert(text && !strcmp(text, command)); free(text);
+    chat = path_join(dir, "chat"); assert(!store_open(&s, chat)); free(chat);
+    assert(s.count == 1 && !strcmp(store_kind(&s, 0), "user"));
+    text = store_message(&s, 0); assert(text && text[0] == '!' && !strcmp(text + 1, command)); free(text);
     store_close(&s); free(dir);
 }
 
@@ -265,12 +276,12 @@ static void recovered(const char *project, const char *root)
     Client c;
     Json *j;
     Store s;
-    char note[1001], *dir, *chat, *text;
+    char note[40001], *dir, *chat, *text;
     dir = setup(project, root, "recoverable-summary", 0);
     set_path("UNII_TEST_FAIL_ONCE", dir, "failed-once");
-    chat = path_join(dir, "chat"); assert(store_open(&s, chat));
-    memset(note, 'L', 1000); note[1000] = 0;
-    assert(store_append(&s, "note", note, NULL, NULL)); store_close(&s);
+    chat = path_join(dir, "chat"); assert(!store_open(&s, chat));
+    memset(note, 'L', 40000); note[40000] = 0; /* over TAIL_BYTES: the turn waits */
+    assert(add_note(&s, note)); store_close(&s);
     c = start(project);
     j = request(&c, 1, "prompt", "TRANSIENT_PREDECESSOR_FAILURE", 0);
     success(j, 1); assert(!strcmp(json_str(json_get(json_get(j, "data"), "disposition")), "handled"));
@@ -278,10 +289,10 @@ static void recovered(const char *project, const char *root)
     j = request(&c, 2, "bash", "printf RECOVERED_NATIVE_COMMAND", 0); success(j, 1); json_free(j);
     j = request(&c, 3, "prompt", "AFTER_RECOVERED_NATIVE_COMMAND", 0); success(j, 1); json_free(j);
     settled(&c); stop(&c); assert(lines(dir) == 1);
-    assert(store_open(&s, chat) && s.count == 6);
-    text = store_message(&s, 1); assert(text && !strcmp(text, "TRANSIENT_PREDECESSOR_FAILURE")); free(text);
-    text = store_message(&s, 2); assert(text && !strcmp(text, "printf RECOVERED_NATIVE_COMMAND")); free(text);
-    text = store_message(&s, 3); assert(text && strstr(text, "exit=0") && strstr(text, "RECOVERED_NATIVE_COMMAND")); free(text);
+    assert(!store_open(&s, chat) && s.count == 7);
+    text = store_message(&s, 2); assert(text && !strcmp(text, "TRANSIENT_PREDECESSOR_FAILURE")); free(text);
+    text = store_message(&s, 3); assert(text && !strcmp(text, "!printf RECOVERED_NATIVE_COMMAND")); free(text);
+    text = store_message(&s, 4); assert(text && strstr(text, "exit=0") && strstr(text, "RECOVERED_NATIVE_COMMAND")); free(text);
     store_close(&s); free(chat); free(dir);
 }
 

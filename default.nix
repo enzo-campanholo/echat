@@ -9,8 +9,7 @@ pkgs.stdenv.mkDerivation {
       !(type == "regular" && (
         pkgs.lib.hasSuffix ".o" path ||
         pkgs.lib.hasSuffix "/unii" path ||
-        pkgs.lib.hasSuffix "_test" path ||
-        pkgs.lib.hasSuffix "/fake_pi" path
+        pkgs.lib.hasSuffix "_test" path
       ));
   };
   strictDeps = true;

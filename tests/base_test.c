@@ -108,7 +108,7 @@ static void utf8_and_clip(void)
     assert(utf8_valid("\xf4\x8f\xbf\xbf"));
     for (i = 0; bad[i]; i++) {
         assert(!utf8_valid(bad[i]));
-        assert(clip_echo(bad[i]) == NULL);
+        assert(clip_echo(bad[i], 30000) == NULL);
     }
     assert(utf8_prefix(mixed, 0) == 0);
     assert(utf8_prefix(mixed, 1) == 1);
@@ -121,7 +121,7 @@ static void utf8_and_clip(void)
     buf_init(&b);
     for (i = 0; i < 30000; i++)
         buf_puts(&b, "\xc3\xa9");
-    clipped = clip_echo(b.s);
+    clipped = clip_echo(b.s, 30000);
     assert(clipped && !strcmp(clipped, b.s));
     free(clipped);
     buf_reset(&b);
@@ -133,7 +133,7 @@ static void utf8_and_clip(void)
         buf_puts(&b, "\xc3\xa9");
     head_bytes = 14987 * 4;
     tail_bytes = 14987 * 2;
-    clipped = clip_echo(b.s);
+    clipped = clip_echo(b.s, 30000);
     assert(clipped && utf8_valid(clipped));
     assert(!memcmp(clipped, b.s, head_bytes));
     marker = strstr(clipped, "\n[... output clipped ...]\n");
@@ -162,7 +162,10 @@ static void file_operations(void)
         buf_putc(&b, 'x');
     buf_puts(&b, "\n\npartial");
     assert(write_all(fd, b.s, b.len) == 0);
+    assert(sync_fd(fd) == 0);
     assert(close(fd) == 0);
+    errno = 0;
+    assert(sync_fd(fd) == -1 && errno == EBADF);
     p = read_file(file);
     assert(p && !strcmp(p, b.s));
     free(p);
@@ -209,13 +212,15 @@ static void file_operations(void)
 
 static void buffers(void)
 {
-    Buf b;
+    Buf b, c;
     size_t i;
     buf_init(&b);
+    buf_init(&c);
     buf_add(&b, "", 0);
     assert(b.s && !b.len && !*b.s);
     buf_puts(&b, "self append");
-    buf_add(&b, b.s, b.len);
+    buf_puts(&c, b.s);
+    buf_add(&b, c.s, c.len);
     assert(!strcmp(b.s, "self appendself append"));
     buf_reset(&b);
     for (i = 0; i < 100000; i++)
@@ -225,6 +230,7 @@ static void buffers(void)
     buf_json(&b, "\001\"\\\b\f\n\r\t\xc3\xa9");
     assert(!strcmp(b.s, "\"\\u0001\\\"\\\\\\b\\f\\n\\r\\t\xc3\xa9\""));
     buf_free(&b);
+    buf_free(&c);
 }
 
 int main(void)

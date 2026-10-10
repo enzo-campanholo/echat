@@ -22,7 +22,9 @@ export function registerMemory(pi, memory) {
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async execute(_id, args) {
       const { id, n = 1, page = 0 } = args;
-      return { content: content(await memory("zoom", { id, n, page })), details: undefined };
+      const result = await memory("zoom", { id, n, page });
+      /* The engine's short reference is what the log records (C4). */
+      return { content: content(result), details: result.log ? { log: result.log } : undefined };
     },
   });
   pi.registerTool({
@@ -66,8 +68,11 @@ export function stableContext(messages, system, tools) {
   ];
 }
 
-/* Cache the shared tools/system, the last four-line block, and request end. */
-export function cachePayload(payload, providerTools) {
+/* Cache the shared tools/system, the last four-line block, and request end.
+ * With MEMORY (turns only), also the previous turn's last whole block while it
+ * is unchanged: a turn that added more than ~20 blocks would otherwise leave
+ * the new mark beyond Anthropic's lookback and rewrite the whole view. */
+export function cachePayload(payload, providerTools, memory) {
   if (!payload || !Array.isArray(payload.messages) || !Array.isArray(payload.system) || !("max_tokens" in payload)) return { payload };
   if (providerTools) payload.tools = structuredClone(providerTools);
   const clean = blocks => {
@@ -100,6 +105,13 @@ export function cachePayload(payload, providerTools) {
     if (foundChat) break;
   }
   if (mark) mark.cache_control = { type: "ephemeral" };
+  if (memory && mark) {
+    const old = memory.at && payload.messages[memory.at[0]]?.content?.[memory.at[1]];
+    const before = memory.at && (memory.at[0] < prefix[0] || (memory.at[0] === prefix[0] && memory.at[1] < prefix[1]));
+    if (before && old?.type === "text" && old.text === memory.text) old.cache_control = { type: "ephemeral" };
+    memory.at = prefix;
+    memory.text = mark.text;
+  }
   const last = payload.messages.at(-1);
   if (last && typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
   const final = last?.content?.at(-1);
@@ -111,7 +123,51 @@ export function cachePayload(payload, providerTools) {
   return { payload, key };
 }
 
-/* Strict JSONL transport shared by the inherited socket and the C daemon. */
+/* JSON.stringify writes a lone UTF-16 surrogate as an escape such as
+ * "\ud800", which the engine's strict parser rejects by closing the channel.
+ * Outgoing text replaces each with U+FFFD instead. */
+const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+export function wellFormed(text) {
+  return typeof text.toWellFormed === "function" ? text.toWellFormed() : text.replace(loneSurrogate, "�");
+}
+const wellFormedStrings = (_key, value) => typeof value === "string" ? wellFormed(value) : value;
+
+/* Summary calls belong to the engine that issued them. Call ids restart at 1
+ * in each engine, so a call's cache gating and result must never reach a
+ * later engine (after /unii restart). PERFORM(event, signal, send) does one
+ * completion, gating through send, and returns its text or throws. */
+export class Calls {
+  constructor(records, perform) {
+    this.records = records;
+    this.perform = perform;
+    this.live = new Map();
+    this.closed = false;
+  }
+  async run(event) {
+    if (this.closed) return;
+    const controller = new AbortController();
+    this.live.set(event.call, controller);
+    let outcome;
+    try {
+      outcome = { text: await this.perform(event, controller.signal, data => this.records.request(data)) };
+    } catch (error) {
+      outcome = { error: error?.message || String(error) };
+    } finally {
+      if (this.live.get(event.call) === controller) this.live.delete(event.call);
+    }
+    /* A cancelled call's late result is refused by the engine; that is fine. */
+    await this.records.request({ op: "result", call: event.call, ...outcome }).catch(() => {});
+  }
+  cancel(call) { this.live.get(call)?.abort(); }
+  /* The engine is going away: abort its calls and start no more. */
+  close() {
+    this.closed = true;
+    for (const controller of this.live.values()) controller.abort();
+  }
+}
+
+/* Strict JSONL transport to the C engine. Records with "event" are
+ * notifications; everything else answers a request by id. */
 export class Records {
   constructor(input, output, notify = () => {}, onFailure = () => {}) {
     this.output = output;
@@ -128,6 +184,7 @@ export class Records {
         this.buffer = this.buffer.subarray(end + 1);
         try {
           const record = JSON.parse(bytes.toString("utf8"));
+          if (record.event) { notify(record); continue; }
           if (record.fatal || ((record.ok === false || record.error) && record.id == null)) {
             this.fail(new Error(record.error || "UniiChat protocol error"));
             return;
@@ -137,7 +194,7 @@ export class Records {
             this.pending.delete(String(record.id));
             if (record.ok === false || record.error) waiter.reject(new Error(record.error || "UniiChat backend error"));
             else waiter.resolve(record);
-          } else notify(record);
+          }
         } catch (error) { this.fail(error); }
       }
     });
@@ -157,10 +214,9 @@ export class Records {
     const id = String(++this.serial);
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.output.write(JSON.stringify({ ...data, id }) + "\n", error => {
+      this.output.write(JSON.stringify({ ...data, id }, wellFormedStrings) + "\n", error => {
         if (error) { this.pending.delete(id); reject(error); }
       });
     });
   }
-  send(data) { this.output.write(JSON.stringify(data) + "\n"); }
 }

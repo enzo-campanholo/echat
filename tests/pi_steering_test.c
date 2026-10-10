@@ -12,14 +12,17 @@ static const char first[] = "FIRST_INPUT_WHILE_MEMORY_WAITS";
 static const char waiting[] = "SECOND_INPUT_DURING_PREPARATION";
 static const char active[] = "THIRD_INPUT_DURING_REPLY";
 static const char following[] = "FOURTH_INPUT_IN_FRESH_TURN";
+static const char typed[] = "TYPED_WHILE_FLUSH_WAITS";
 static pid_t running;
+static int progress, restored;
 
 static void timeout_handler(int sig)
 {
     static const char text[] = "Pi steering test exceeded 45 seconds\n";
     (void)sig;
     if (running > 0) kill(-running, SIGKILL);
-    write(2, text, sizeof(text) - 1);
+    if (write(2, text, sizeof(text) - 1) < 0)
+        _exit(125);
     _exit(124);
 }
 
@@ -32,41 +35,13 @@ static void gate(const char *path, int read_side)
     assert(!fclose(f));
 }
 
-/* A delayed compactor. FIFOs make the waiting-input race deterministic. */
-static int compactor(void)
+static int add_note(Store *s, const char *text)
 {
-    Buf input, response;
-    Json *j;
-    const char *type;
-    FILE *f;
-    int first_call;
-    first_call = 1;
-    buf_init(&input); buf_init(&response);
-    while (read_line(stdin, &input) == 1) {
-        j = json_parse(input.s); assert(j);
-        type = json_str(json_get(j, "type"));
-        buf_reset(&response);
-        buf_puts(&response, "{\"type\":\"response\",\"success\":true,\"id\":");
-        json_dump(&response, json_get(j, "id"));
-        buf_puts(&response, ",\"command\":"); json_dump(&response, json_get(j, "type"));
-        buf_puts(&response, "}\n");
-        assert(fputs(response.s, stdout) >= 0 && !fflush(stdout));
-        if (type && !strcmp(type, "prompt")) {
-            if (first_call) {
-                f = fopen(getenv("UNII_TEST_COMPACTION_STARTED"), "wb");
-                assert(f && fputc('1', f) != EOF && !fclose(f));
-                gate(getenv("UNII_TEST_COMPACTION_GATE"), 1);
-                first_call = 0;
-            }
-            fputs("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\","
-                  "\"content\":[{\"type\":\"text\",\"text\":\"note: long seed preserved\"}],"
-                  "\"stopReason\":\"stop\"}}\n{\"type\":\"agent_settled\"}\n", stdout);
-            assert(!fflush(stdout));
-        }
-        json_free(j);
-    }
-    buf_free(&input); buf_free(&response);
-    return 0;
+    Entry e;
+    e.kind = "note";
+    e.text = text;
+    e.images = NULL;
+    return !store_append(s, &e, 1, NULL, NULL);
 }
 
 static void set_path(const char *name, const char *dir, const char *file)
@@ -81,9 +56,10 @@ static pid_t start(FILE **in, FILE **out, const char *project)
 {
     int input[2], output[2];
     pid_t pid;
-    char *extension, *provider;
+    char *extension, *provider, *summary;
     extension = path_join(project, "pi/unii.ts");
     provider = path_join(project, "tests/pi_steering_model.ts");
+    summary = path_join(project, "tests/pi_summary_model.ts");
     assert(!pipe(input) && !pipe(output));
     pid = fork(); assert(pid >= 0);
     if (!pid) {
@@ -93,7 +69,7 @@ static pid_t start(FILE **in, FILE **out, const char *project)
         execlp("pi", "pi", "--mode", "rpc", "--no-session", "--offline",
                "--no-extensions", "--no-skills", "--no-prompt-templates",
                "--no-context-files", "--no-mcp", "--no-approve",
-               "--extension", extension, "--extension", provider,
+               "--extension", extension, "--extension", provider, "--extension", summary,
                "--provider", "unii-steering", "--model", "deterministic",
                "--tools", "zoom,date", (char *)NULL);
         _exit(127);
@@ -101,7 +77,7 @@ static pid_t start(FILE **in, FILE **out, const char *project)
     close(input[0]); close(output[1]);
     *in = fdopen(output[0], "r"); *out = fdopen(input[1], "w");
     assert(*in && *out);
-    free(extension); free(provider);
+    free(extension); free(provider); free(summary);
     return pid;
 }
 
@@ -121,7 +97,7 @@ static Json *receive(FILE *in)
 {
     Buf b;
     Json *j;
-    const char *type, *reason;
+    const char *type, *reason, *method, *status;
     buf_init(&b);
     assert(read_line(in, &b) == 1);
     j = json_parse(b.s); assert(j);
@@ -131,6 +107,16 @@ static Json *receive(FILE *in)
         (reason && (!strcmp(reason, "error") || !strcmp(reason, "aborted"))))) {
         fprintf(stderr, "Pi steering failed: %s\n", b.s);
         assert(0);
+    }
+    /* Memory progress reaches RPC clients as setStatus records (B4). */
+    method = json_str(json_get(j, "method"));
+    status = json_str(json_get(j, "statusText"));
+    if (type && !strcmp(type, "extension_ui_request") && method &&
+        !strcmp(method, "setStatus") && status) {
+        if (strstr(status, "summarizing "))
+            progress++;
+        else if (progress && !strncmp(status, "UniiChat \302\267 /", 13))
+            restored++;
     }
     buf_free(&b);
     return j;
@@ -235,9 +221,9 @@ static void saved_words(const char *dir)
     unsigned long i;
     int a, b, c, d;
     path = path_join(dir, "chat");
-    assert(store_open(&s, path)); free(path);
+    assert(!store_open(&s, path)); free(path);
     a = b = c = d = 0;
-    assert(s.count == 8);
+    assert(s.count == 9);
     for (i = 0; i < s.count; i++) {
         message = store_message(&s, i); assert(message);
         if (!strcmp(message, first)) a++;
@@ -250,16 +236,80 @@ static void saved_words(const char *dir)
     store_close(&s);
 }
 
+/* A message typed while /unii flush waits supersedes the flush: the flush
+ * ends with a notice and the message starts its turn, saved once. */
+static void flush_superseded(const char *project, const char *root)
+{
+    char note[1001], *path, *message;
+    const char *type, *method, *text, *kind, *disposition;
+    FILE *in, *out, *f;
+    Store s;
+    Json *j;
+    unsigned long got, i;
+    int status, before, notice, started, saved;
+    set_path("UNII_DIR", root, "flush-chat");
+    set_path("UNII_TEST_PROVIDER_LOG", root, "flush-provider.jsonl");
+    path = path_join(root, "flush-chat");
+    assert(!store_open(&s, path));
+    memset(note, 'F', 1000); note[1000] = 0; /* needs a summary call; fits <recent> */
+    assert(add_note(&s, note)); store_close(&s);
+    alarm(45); running = start(&in, &out, project);
+    before = progress;
+    send(out, 1, "prompt", "/unii flush");
+    f = fopen(getenv("UNII_TEST_COMPACTION_STARTED"), "rb");
+    assert(f && fgetc(f) == '1' && !fclose(f)); /* the call is held at its gate */
+    while (progress == before) /* the engine reports the waiting flush */
+        json_free(receive(in));
+    send(out, 2, "prompt", typed);
+    notice = started = 0;
+    while (!notice || !started) {
+        j = receive(in);
+        type = json_str(json_get(j, "type"));
+        method = json_str(json_get(j, "method"));
+        text = json_str(json_get(j, "message"));
+        if (type && !strcmp(type, "extension_ui_request") && method && !strcmp(method, "notify")) {
+            assert(text && !strstr(text, "stopped") && !strstr(text, "did not save"));
+            kind = json_str(json_get(j, "notifyType"));
+            if (strstr(text, "flush superseded by a turn")) {
+                assert(kind && !strcmp(kind, "error"));
+                notice = 1;
+            }
+        }
+        if (type && !strcmp(type, "response") && json_ulong(json_get(j, "id"), &got) && got == 2) {
+            disposition = json_str(json_get(json_get(j, "data"), "disposition"));
+            assert(disposition && !strcmp(disposition, "started"));
+            started = 1;
+        }
+        json_free(j);
+    }
+    gate(getenv("UNII_TEST_COMPACTION_GATE"), 0);
+    gate(getenv("UNII_TEST_REPLY_GATE"), 0);
+    event(in, "agent_settled", NULL);
+    assert(!fclose(out));
+    while (fgetc(in) != EOF) ;
+    assert(!fclose(in) && waitpid(running, &status, 0) == running);
+    running = 0; alarm(0);
+    assert(WIFEXITED(status) && !WEXITSTATUS(status));
+    assert(!store_open(&s, path)); free(path);
+    saved = 0;
+    for (i = 0; i < s.count; i++) {
+        message = store_message(&s, i); assert(message);
+        saved += !strcmp(message, typed);
+        free(message);
+    }
+    assert(saved == 1);
+    store_close(&s);
+}
+
 int main(int argc, char **argv)
 {
-    char project[4096], seed[1001], *path;
+    char project[4096], seed[33001], *path;
     FILE *in, *out, *f;
     Store s;
     int status;
-    if (argc > 1 && !strcmp(argv[1], "--mode")) return compactor();
     assert(argc == 2 && getcwd(project, sizeof(project)) && !mkdirs(argv[1]));
     set_path("UNII_BIN", project, "unii");
-    set_path("UNII_PI", project, "tests/pi_steering_test");
+    assert(!setenv("UNII_PROVIDER", "unii-summary", 1) && !setenv("UNII_MODEL", "deterministic", 1));
     set_path("UNII_DIR", argv[1], "chat");
     set_path("UNII_TEST_PROVIDER_LOG", argv[1], "provider.jsonl");
     set_path("UNII_TEST_COMPACTION_STARTED", argv[1], "compaction-started");
@@ -267,13 +317,15 @@ int main(int argc, char **argv)
     set_path("UNII_TEST_REPLY_GATE", argv[1], "reply-gate");
     set_path("PI_CODING_AGENT_DIR", argv[1], "pi-config");
     assert(!setenv("PI_OFFLINE", "1", 1) && !unsetenv("UNII_INSTRUCTIONS"));
+    assert(!setenv("UNII_TEST_SUMMARY_SHORT", "1", 1));
     assert(!mkfifo(getenv("UNII_TEST_COMPACTION_STARTED"), 0600));
     assert(!mkfifo(getenv("UNII_TEST_COMPACTION_GATE"), 0600));
     assert(!mkfifo(getenv("UNII_TEST_REPLY_GATE"), 0600));
     path = path_join(argv[1], "chat");
-    assert(store_open(&s, path)); free(path);
-    memset(seed, 'S', 1000); seed[1000] = 0;
-    assert(store_append(&s, "note", seed, NULL, NULL)); store_close(&s);
+    assert(!store_open(&s, path)); free(path);
+    /* Over TAIL_BYTES (two messages), so the turn waits for summaries. */
+    memset(seed, 'S', 33000); seed[33000] = 0;
+    assert(add_note(&s, seed)); store_close(&s);
     assert(signal(SIGALRM, timeout_handler) != SIG_ERR);
     alarm(45); running = start(&in, &out, project);
     send(out, 1, "prompt", first);
@@ -294,6 +346,8 @@ int main(int argc, char **argv)
     running = 0; alarm(0);
     assert(WIFEXITED(status) && !WEXITSTATUS(status));
     contexts(argv[1]); saved_words(argv[1]);
-    puts("live Pi steering: waiting inputs, active steering, fresh following turn, durable words OK");
+    assert(progress >= 1 && restored >= 1);
+    flush_superseded(project, argv[1]);
+    puts("live Pi steering: waiting inputs, active steering, fresh following turn, durable words, input during flush OK");
     return 0;
 }

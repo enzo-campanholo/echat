@@ -20,7 +20,8 @@ static void timeout_handler(int signal_number)
     (void)signal_number;
     if (running > 0)
         kill(-running, SIGKILL);
-    write(2, text, sizeof(text) - 1);
+    if (write(2, text, sizeof(text) - 1) < 0)
+        _exit(125);
     _exit(124);
 }
 
@@ -36,9 +37,10 @@ static pid_t start(FILE **input, FILE **output, const char *project)
 {
     int in[2], out[2];
     pid_t pid;
-    char *frontend, *provider;
+    char *frontend, *provider, *summary;
     frontend = path_join(project, "pi/unii.ts");
     provider = path_join(project, "tests/pi_model.ts");
+    summary = path_join(project, "tests/pi_summary_model.ts");
     assert(pipe(in) == 0 && pipe(out) == 0);
     pid = fork();
     assert(pid >= 0);
@@ -49,7 +51,7 @@ static pid_t start(FILE **input, FILE **output, const char *project)
         execlp("pi", "pi", "--mode", "rpc", "--no-session", "--offline",
                "--no-extensions", "--no-skills", "--no-prompt-templates",
                "--no-context-files", "--no-mcp", "--no-approve",
-               "--extension", frontend, "--extension", provider,
+               "--extension", frontend, "--extension", provider, "--extension", summary,
                "--provider", "unii-test", "--model", "deterministic",
                "--tools", "read,zoom,date", (char *)NULL);
         perror("pi");
@@ -60,7 +62,7 @@ static pid_t start(FILE **input, FILE **output, const char *project)
     *output = fdopen(in[1], "w");
     assert(*input && *output);
     free(frontend);
-    free(provider);
+    free(provider); free(summary);
     return pid;
 }
 
@@ -82,6 +84,34 @@ static void send_record(FILE *out, const char *type, const char *message, int im
     }
     buf_puts(&b, "}\n");
     assert(fwrite(b.s, 1, b.len, out) == b.len && fflush(out) == 0);
+    buf_free(&b);
+}
+
+/* /unii flush: memory catches up, so turn 2 sees summaries, not <recent>. */
+static void flush(FILE *in, FILE *out)
+{
+    Buf b;
+    Json *j;
+    const char *type, *method, *message, *id;
+    int answered, flushed;
+    static const char record[] = "{\"type\":\"prompt\",\"id\":\"flush\",\"message\":\"/unii flush\"}\n";
+    assert(fwrite(record, 1, sizeof(record) - 1, out) == sizeof(record) - 1 && fflush(out) == 0);
+    answered = flushed = 0;
+    buf_init(&b);
+    while ((!answered || !flushed) && read_line(in, &b) == 1) {
+        j = json_parse(b.s);
+        assert(j);
+        type = json_str(json_get(j, "type"));
+        method = json_str(json_get(j, "method"));
+        message = json_str(json_get(j, "message"));
+        id = json_str(json_get(j, "id"));
+        if (type && !strcmp(type, "response") && id && !strcmp(id, "flush"))
+            answered = 1;
+        if (method && !strcmp(method, "notify") && message && strstr(message, "\"ok\":true"))
+            flushed = 1;
+        json_free(j);
+    }
+    assert(answered && flushed);
     buf_free(&b);
 }
 
@@ -329,14 +359,15 @@ static void image_compactions(const char *dir)
             assert(0);
         json_free(j);
     }
-    assert(user == 1 && echo == 1 && fclose(f) == 0);
+    assert(user == 1 && echo == 0 && fclose(f) == 0); /* zoom echoes hold no images */
     buf_free(&b);
 }
 
 static void permanent_log(const char *dir)
 {
     Store s;
-    char *path, *text, *images;
+    char *path, *text, *images, *date0;
+    Ref r;
     Json *j;
     unsigned long i;
     unsigned int l;
@@ -344,12 +375,14 @@ static void permanent_log(const char *dir)
     int users, replies, calls, echoes, zoom, date, read;
     int opened, dated, read_result, image_messages;
     path = path_join(dir, "chat");
-    if (!store_open(&s, path)) {
+    if (store_open(&s, path) < 0) {
         fprintf(stderr, "live Pi chat could not reopen: %s\n", s.error);
         assert(0);
     }
     free(path);
     users = replies = calls = echoes = zoom = date = read = 0;
+    date0 = store_date(&s, 0);
+    assert(date0);
     opened = dated = read_result = 0;
     image_messages = 0;
     assert(s.count == 13);
@@ -361,7 +394,7 @@ static void permanent_log(const char *dir)
             assert(!strcmp(text, first_message));
         if (i == 9)
             assert(!strcmp(text, second_message));
-        assert(s.messages[i].has_images == (i == 9 || i == 11));
+        assert(s.messages[i].has_images == (i == 9));
         if (s.messages[i].has_images) {
             images = store_images(&s, i);
             j = json_parse(images);
@@ -370,22 +403,23 @@ static void permanent_log(const char *dir)
             free(images);
             image_messages++;
         }
-        if (!strcmp(s.messages[i].kind, "user"))
+        if (!strcmp(store_kind(&s, i), "user"))
             users++;
-        if (!strcmp(s.messages[i].kind, "unii"))
+        if (!strcmp(store_kind(&s, i), "unii"))
             replies++;
-        if (!strcmp(s.messages[i].kind, "tool")) {
+        if (!strcmp(store_kind(&s, i), "tool")) {
             calls++;
             if (!strncmp(text, "zoom ", 5)) zoom++;
             if (!strncmp(text, "date ", 5)) date++;
             if (!strncmp(text, "read ", 5)) read++;
         }
-        if (!strcmp(s.messages[i].kind, "echo")) {
+        if (!strcmp(store_kind(&s, i), "echo")) {
             echoes++;
             assert(*text);
-            if (strstr(text, first_message) && strstr(text, "kind=user"))
+            if (!strcmp(text, i == 5 ? "zoom {\"id\":0,\"n\":1,\"page\":0}: message 0 page 0/1, 42 bytes; not copied; zoom again to read" :
+                        "zoom {\"id\":9,\"n\":1,\"page\":0}: message 9 page 0/1, 17 bytes; not copied; zoom again to read"))
                 opened++;
-            if (!strcmp(text, store_date(&s, 0)))
+            if (!strcmp(text, date0))
                 dated++;
             if (strstr(text, "LIVE_FILE_CONTENT")) {
                 read_result++;
@@ -396,13 +430,19 @@ static void permanent_log(const char *dir)
     }
     assert(users == 2 && replies == 3 && calls == 4 && echoes == 4);
     assert(zoom == 2 && date == 1 && read == 1);
-    assert(opened == 1 && dated == 1 && read_result == 1);
-    assert(image_messages == 2);
+    assert(opened == 2 && dated == 1 && read_result == 1);
+    assert(image_messages == 1);
     for (l = 0; l < TREE_LEVELS; l++)
         for (k = 0; k < s.capacities[l]; k++)
-            if (s.levels[l][k].text)
-                assert(!strstr(s.levels[l][k].text, "NEVER_LOG_LIVE_THINKING") &&
-                       !strstr(s.levels[l][k].text, "never log this thought"));
+            if (s.levels[l][k].size) {
+                r.l = l;
+                r.i = k;
+                text = store_text(&s, r);
+                assert(text && !strstr(text, "NEVER_LOG_LIVE_THINKING") &&
+                       !strstr(text, "never log this thought"));
+                free(text);
+            }
+    free(date0);
     store_close(&s);
 }
 
@@ -415,7 +455,7 @@ int main(int argc, char **argv)
     assert(argc == 2 && getcwd(project, sizeof(project)));
     assert(mkdirs(argv[1]) == 0);
     set_path("UNII_BIN", project, "unii");
-    set_path("UNII_PI", project, "tests/fake_pi");
+    assert(!setenv("UNII_PROVIDER", "unii-summary", 1) && !setenv("UNII_MODEL", "deterministic", 1));
     set_path("UNII_DIR", argv[1], "chat");
     set_path("UNII_TEST_PROVIDER_LOG", argv[1], "provider.jsonl");
     set_path("UNII_TEST_COMPACTION_LOG", argv[1], "compactions.jsonl");
@@ -441,6 +481,7 @@ int main(int argc, char **argv)
     thoughts = calls = 0;
     send_record(out, "prompt", first_message, 0);
     finish_turn(in, &thoughts, &calls);
+    flush(in, out);
     send_record(out, "prompt", second_message, 1);
     finish_turn(in, &thoughts, &calls);
     assert(thoughts == 1 && calls == 4);

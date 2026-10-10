@@ -12,7 +12,7 @@ char *xstrdup(const char *s);
 void buf_init(Buf *b);
 void buf_free(Buf *b);
 void buf_reset(Buf *b);
-void buf_add(Buf *b, const void *s, size_t n);
+void buf_add(Buf *b, const void *s, size_t n); /* s must not point into b */
 void buf_puts(Buf *b, const char *s);
 void buf_putc(Buf *b, int c);
 void buf_ulong(Buf *b, unsigned long n);
@@ -20,9 +20,10 @@ void buf_json(Buf *b, const char *s);
 int read_line(FILE *f, Buf *b); /* 1: LF-terminated record; 0: EOF; -1: partial/error */
 char *read_file(const char *path);
 int write_all(int fd, const void *data, size_t n);
+int sync_fd(int fd); /* durable barrier: F_FULLFSYNC where defined, else fsync */
 size_t utf8_prefix(const char *s, size_t n); /* complete codepoints in first n bytes */
 int utf8_valid(const char *s);
-char *clip_echo(const char *s); /* head + marker + tail: 30,000 codepoints total */
+char *clip_echo(const char *s, size_t chars); /* head + marker + tail: CHARS code points */
 char *path_join(const char *a, const char *b);
 int mkdirs(const char *path);
 

@@ -2,6 +2,7 @@
 #include "store.h"
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -11,7 +12,7 @@
 
 typedef struct Client { FILE *in, *out; pid_t pid; } Client;
 static pid_t running;
-static int summary_notices;
+static int summary_notices, dropped_notices;
 static char *summary_notice;
 static const char saved_input[] = "WORDS_SURVIVE_A_FAILED_PREDECESSOR";
 
@@ -20,8 +21,18 @@ static void timeout_handler(int sig)
     static const char text[] = "Pi failure test exceeded 45 seconds\n";
     (void)sig;
     if (running > 0) kill(-running, SIGKILL);
-    write(2, text, sizeof(text) - 1);
+    if (write(2, text, sizeof(text) - 1) < 0)
+        _exit(125);
     _exit(124);
+}
+
+static int add_note(Store *s, const char *text)
+{
+    Entry e;
+    e.kind = "note";
+    e.text = text;
+    e.images = NULL;
+    return !store_append(s, &e, 1, NULL, NULL);
 }
 
 static void set_path(const char *name, const char *dir, const char *file)
@@ -30,6 +41,21 @@ static void set_path(const char *name, const char *dir, const char *file)
     path = path_join(dir, file);
     assert(setenv(name, path, 1) == 0);
     free(path);
+}
+
+/* With UNII_TEST_FAIL_APPEND_ONCE, only the first backend fails (B6). */
+static int once(void)
+{
+    const char *marker;
+    int fd;
+    marker = getenv("UNII_TEST_FAIL_APPEND_ONCE");
+    if (!marker)
+        return 1;
+    fd = open(marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0)
+        return 0;
+    close(fd);
+    return 1;
 }
 
 /* A real backend with injected summary errors or a failed append. */
@@ -85,12 +111,12 @@ static int proxy(int argc, char **argv)
                 j = json_parse(pending.s);
                 assert(j);
                 op = json_str(json_get(j, "op"));
-                if (summary_errors && op && !strcmp(op, "configure")) {
+                if (summary_errors && op && !strcmp(op, "hello")) {
                     assert(write_all(1, summary_error, sizeof(summary_error) - 1) == 0);
                     assert(write_all(1, summary_error, sizeof(summary_error) - 1) == 0);
                     summary_errors = 0;
                 }
-                if (op && !strcmp(op, "append") && ++appends == fail_append) {
+                if (op && !strcmp(op, "append") && ++appends == fail_append && once()) {
                     json_free(j);
                     kill(pid, SIGTERM);
                     assert(waitpid(pid, &status, 0) == pid);
@@ -117,11 +143,12 @@ static Client start(const char *project)
 {
     Client c;
     int input[2], output[2];
-    char *extension, *provider;
-    summary_notices = 0;
+    char *extension, *provider, *summary;
+    summary_notices = dropped_notices = 0;
     free(summary_notice); summary_notice = NULL;
     extension = path_join(project, "pi/unii.ts");
     provider = path_join(project, "tests/pi_failure_model.ts");
+    summary = path_join(project, "tests/pi_summary_model.ts");
     assert(!pipe(input) && !pipe(output));
     c.pid = fork();
     assert(c.pid >= 0);
@@ -132,7 +159,7 @@ static Client start(const char *project)
         execlp("pi", "pi", "--mode", "rpc", "--no-session", "--offline",
                "--no-extensions", "--no-skills", "--no-prompt-templates",
                "--no-context-files", "--no-mcp", "--no-approve",
-               "--extension", extension, "--extension", provider,
+               "--extension", extension, "--extension", provider, "--extension", summary,
                "--provider", "unii-failure", "--model", "deterministic",
                "--tools", "probe,zoom,date", (char *)NULL);
         _exit(127);
@@ -140,7 +167,7 @@ static Client start(const char *project)
     close(input[0]); close(output[1]);
     c.in = fdopen(output[0], "r"); c.out = fdopen(input[1], "w");
     assert(c.in && c.out);
-    free(extension); free(provider);
+    free(extension); free(provider); free(summary);
     running = c.pid;
     alarm(45);
     return c;
@@ -174,6 +201,9 @@ static void accepted(Client *c, const char *disposition)
             summary_notices++;
             free(summary_notice); summary_notice = xstrdup(message);
         }
+        if (type && !strcmp(type, "extension_ui_request") &&
+            message && strstr(message, "did not save this message"))
+            dropped_notices++;
         if (type && !strcmp(type, "response")) {
             actual = json_str(json_get(json_get(j, "data"), "disposition"));
             if (!actual || strcmp(actual, disposition)) {
@@ -187,6 +217,37 @@ static void accepted(Client *c, const char *disposition)
     }
     assert(done);
     buf_free(&line);
+}
+
+/* Run a slash command; return its notify text once its response arrived. */
+static char *command(Client *c, unsigned long id, const char *text)
+{
+    Buf line;
+    Json *j;
+    const char *type, *method, *message;
+    unsigned long got;
+    char *notice;
+    int answered;
+    send_prompt(c, id, text);
+    notice = NULL;
+    answered = 0;
+    buf_init(&line);
+    while ((!notice || !answered) && read_line(c->in, &line) == 1) {
+        j = json_parse(line.s);
+        assert(j);
+        type = json_str(json_get(j, "type"));
+        method = json_str(json_get(j, "method"));
+        message = json_str(json_get(j, "message"));
+        if (type && !strcmp(type, "extension_ui_request") && method &&
+            !strcmp(method, "notify") && message && message[0] == '{' && !notice)
+            notice = xstrdup(message);
+        if (type && !strcmp(type, "response") && json_ulong(json_get(j, "id"), &got) && got == id)
+            answered = 1;
+        json_free(j);
+    }
+    assert(notice && answered);
+    buf_free(&line);
+    return notice;
 }
 
 static void settled(Client *c)
@@ -242,13 +303,48 @@ static void check_calls(const char *dir, size_t provider, size_t tools)
     assert(lines(path) == tools); free(path);
 }
 
+static void recent_context(const char *dir, const char *note)
+{
+    char *path, *chat, *recent, *input;
+    FILE *f;
+    Buf line, text, expected;
+    Json *j;
+    const Json *m, *block;
+    path = path_join(dir, "provider.jsonl");
+    f = fopen(path, "rb");
+    assert(f);
+    free(path);
+    buf_init(&line); buf_init(&text); buf_init(&expected);
+    assert(read_line(f, &line) == 1);
+    j = json_parse(line.s);
+    assert(j);
+    for (m = json_get(j, "messages")->child; m; m = m->next)
+        if (!strcmp(json_str(json_get(m, "role")), "user"))
+            break;
+    assert(m);
+    for (block = json_get(m, "content")->child; block; block = block->next)
+        if (json_str(json_get(block, "text")))
+            buf_puts(&text, json_str(json_get(block, "text")));
+    buf_puts(&expected, "<recent>\n[message 0 kind=note]\n");
+    buf_puts(&expected, note);
+    buf_puts(&expected, "\n</recent>\n\nCurrent date: ");
+    chat = strstr(text.s, "</chat>\n");
+    recent = strstr(text.s, expected.s);
+    input = strstr(text.s, saved_input);
+    assert(chat && recent && input && chat < recent && recent < input);
+    assert(!strstr(text.s + 7, note) || strstr(text.s, note) == recent + 31);
+    json_free(j);
+    assert(!fclose(f));
+    buf_free(&line); buf_free(&text); buf_free(&expected);
+}
+
 static char *setup(const char *project, const char *dir, const char *name)
 {
     char *path;
     path = path_join(dir, name);
     assert(!mkdirs(path));
     set_path("UNII_BIN", project, "unii");
-    set_path("UNII_PI", project, "tests/fake_pi");
+    assert(!setenv("UNII_PROVIDER", "unii-summary", 1) && !setenv("UNII_MODEL", "deterministic", 1));
     set_path("UNII_DIR", path, "chat");
     set_path("UNII_TEST_PROVIDER_LOG", path, "provider.jsonl");
     set_path("UNII_TEST_PROBE", path, "probe.txt");
@@ -257,6 +353,7 @@ static char *setup(const char *project, const char *dir, const char *name)
     assert(!unsetenv("UNII_TEST_ZOOM"));
     assert(!unsetenv("UNII_TEST_MISSING_LOG"));
     assert(!unsetenv("UNII_TEST_SUMMARY_ERRORS") && !unsetenv("UNII_TEST_FAIL_APPEND"));
+    assert(!unsetenv("UNII_TEST_FAIL_MARKER"));
     return path;
 }
 
@@ -269,7 +366,7 @@ static char *seed_note(const char *dir)
     char *chat, *log;
     FILE *f;
     chat = path_join(dir, "chat");
-    assert(store_open(&s, chat));
+    assert(!store_open(&s, chat));
     store_close(&s);
     log = path_join(chat, "main/2000-01-01.jsonl");
     free(chat);
@@ -286,7 +383,7 @@ static void saved_words(const char *dir)
     unsigned long i;
     int count;
     path = path_join(dir, "chat");
-    assert(store_open(&s, path)); free(path);
+    assert(!store_open(&s, path)); free(path);
     count = 0;
     for (i = 0; i < s.count; i++) {
         text = store_message(&s, i); assert(text);
@@ -299,7 +396,8 @@ static void saved_words(const char *dir)
 
 int main(int argc, char **argv)
 {
-    char project[4096], note[1001], *dir, *chat, *log, *hidden;
+    char project[4096], note[40001], *dir, *chat, *log, *hidden, *notice;
+    FILE *f;
     Buf path;
     Client c;
     Store s;
@@ -318,6 +416,7 @@ int main(int argc, char **argv)
     assert(!setenv("UNII_BIN", "/definitely/missing/unii-test", 1));
     c = start(project);
     send_prompt(&c, 1, "MUST_STOP_WITHOUT_MEMORY"); accepted(&c, "handled");
+    assert(dropped_notices == 1);
     stop(&c); check_calls(dir, 0, 0); free(dir);
 
     dir = setup(project, argv[1], "summary-errors");
@@ -336,16 +435,37 @@ int main(int argc, char **argv)
     dir = setup(project, argv[1], "predecessor");
     set_path("UNII_TEST_FAIL_ONCE", dir, "failed-once");
     chat = path_join(dir, "chat");
-    assert(store_open(&s, chat)); free(chat);
-    memset(note, 'L', 1000); note[1000] = 0;
-    assert(store_append(&s, "note", note, NULL, NULL));
+    assert(!store_open(&s, chat)); free(chat);
+    /* Over TAIL_BYTES (two messages), so the turn waits for its summaries. */
+    memset(note, 'L', 40000); note[40000] = 0;
+    assert(add_note(&s, note));
     store_close(&s);
     c = start(project);
     send_prompt(&c, 1, saved_input); accepted(&c, "handled");
     check_calls(dir, 0, 0);
-    send_prompt(&c, 2, "RETRY_WITH_COMPLETE_MEMORY"); accepted(&c, "started");
+    /* Retry without inventing a message, then finish the turn's memory. */
+    notice = command(&c, 2, "/unii retry"); assert(strstr(notice, "\"ok\":true")); free(notice);
+    notice = command(&c, 3, "/unii flush"); assert(strstr(notice, "\"ok\":true")); free(notice);
+    send_prompt(&c, 4, "RETRY_WITH_COMPLETE_MEMORY"); accepted(&c, "started");
     settled(&c); stop(&c);
     check_calls(dir, 2, 1); saved_words(dir); free(dir);
+
+    /* C2: every summary fails, yet the turn runs: the unsummarized note
+     * follows the view whole, in <recent>, before the date and the input. */
+    dir = setup(project, argv[1], "recent");
+    set_path("UNII_TEST_FAIL_MARKER", dir, "summaries-fail");
+    f = fopen(getenv("UNII_TEST_FAIL_MARKER"), "w");
+    assert(f && !fclose(f));
+    chat = path_join(dir, "chat");
+    assert(!store_open(&s, chat)); free(chat);
+    memset(note, 'R', 1000); note[1000] = 0;
+    assert(add_note(&s, note));
+    store_close(&s);
+    c = start(project);
+    send_prompt(&c, 1, saved_input); accepted(&c, "started");
+    settled(&c); stop(&c);
+    check_calls(dir, 2, 1); recent_context(dir, note); saved_words(dir); free(dir);
+    assert(!unsetenv("UNII_TEST_FAIL_MARKER"));
 
     dir = setup(project, argv[1], "nul");
     c = start(project);
@@ -356,10 +476,17 @@ int main(int argc, char **argv)
     dir = setup(project, argv[1], "append");
     set_path("UNII_TEST_REAL_BIN", project, "unii");
     set_path("UNII_BIN", project, "tests/pi_failure_test");
+    set_path("UNII_TEST_FAIL_APPEND_ONCE", dir, "failed-append");
     c = start(project);
     send_prompt(&c, 1, saved_input); accepted(&c, "started");
+    settled(&c);
+    /* The backend died; /unii restart relaunches it without restarting pi. */
+    notice = command(&c, 2, "/unii restart");
+    assert(strstr(notice, "\"ok\":true") && strstr(notice, "restarted")); free(notice);
+    send_prompt(&c, 3, "AFTER_RESTART"); accepted(&c, "started");
     settled(&c); stop(&c);
-    check_calls(dir, 1, 0); saved_words(dir); free(dir);
+    check_calls(dir, 2, 0); saved_words(dir); free(dir);
+    assert(!unsetenv("UNII_TEST_FAIL_APPEND_ONCE"));
 
     dir = setup(project, argv[1], "missing-log");
     log = seed_note(dir);

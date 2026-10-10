@@ -4,9 +4,7 @@
 /tests/store_test
 /tests/view_test
 /tests/engine_test
-/tests/fake_pi
 /tests/server_test
-/tests/pi_test
 /tests/pi_live_test
 /tests/pi_worker_test
 /tests/pi_failure_test

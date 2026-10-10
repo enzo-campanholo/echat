@@ -1,9 +1,7 @@
 #include "engine.h"
 #include <errno.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 static void enqueue(Queue *q, Job j)
 {
@@ -40,6 +38,12 @@ static unsigned long context_end(Job j)
     return ref_start(j.ref) + (j.ref.l ? ref_span(j.ref) : 0);
 }
 
+/* Fits the 32 KB context, judged from sizes alone. */
+static int fits(Engine *e, Job j)
+{
+    return view_prefix(e->store, &e->compact, context_end(j), 1) <= COMPACT_HIGH;
+}
+
 /* Oversized jobs wait in a min-heap by their context's end. A built ancestor
  * cannot cross an unbuilt job, so these prefixes increase with the cutoff.
  * Only a view merge can make the smallest blocked prefix fit. */
@@ -51,7 +55,7 @@ static void defer(Engine *e, Job j)
     q = &e->deferred;
     n = store_slot(e->store, j.ref);
     n->busy = 0;
-    n->queued = 3;
+    n->queued = NODE_DEFERRED;
     j.retry = 1; /* a deferred leaf is already counted in inflight */
     enqueue(q, j);
     i = q->n - 1;
@@ -69,17 +73,14 @@ static int take_deferred(Engine *e, Job *j)
 {
     Queue *q;
     Job last;
-    char *view;
     size_t i, child;
     q = &e->deferred;
     if (!e->deferred_ready || !q->n)
         return 0;
-    view = engine_context(e, q->v[0]);
-    if (!view) {
+    if (!fits(e, q->v[0])) {
         e->deferred_ready = 0;
         return 0;
     }
-    free(view);
     *j = q->v[0];
     last = q->v[--q->n];
     i = 0;
@@ -103,69 +104,45 @@ static void ready(Engine *e, Ref r)
     Node *n;
     Job j;
     n = store_slot(e->store, r);
-    if (!n || n->text || n->queued || n->busy)
+    if (!n || n->size || n->queued || n->busy)
         return;
-    n->queued = 1;
+    n->queued = NODE_READY;
     j.ref = r;
     j.retry = 0;
+    j.fails = 0;
+    j.due = 0;
     enqueue(r.l ? &e->ready : &e->leaves, j);
 }
 
 static int save_compact(Engine *e)
 {
     Buf b;
-    char *path, *tmp;
-    size_t i;
-    int fd, ok;
+    int result;
     buf_init(&b);
     buf_puts(&b, "{\"shrinking\":");
-    buf_ulong(&b, (unsigned long)e->compact.shrinking);
-    buf_puts(&b, ",\"view\":[");
-    for (i = 0; i < e->compact.n; i++) {
-        if (i)
-            buf_putc(&b, ',');
-        buf_putc(&b, '[');
-        buf_ulong(&b, e->compact.v[i].l);
-        buf_putc(&b, ',');
-        buf_ulong(&b, e->compact.v[i].i);
-        buf_putc(&b, ']');
-    }
-    buf_puts(&b, "]}\n");
-    path = path_join(e->store->dir, "compaction-view.json");
-    tmp = path_join(e->store->dir, ".compaction-view.tmp");
-    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    ok = fd >= 0 && write_all(fd, b.s, b.len) == 0 && fsync(fd) == 0;
-    if (fd >= 0 && close(fd) < 0)
-        ok = 0;
-    if (ok && rename(tmp, path) < 0)
-        ok = 0;
-    if (ok) {
-        fd = open(e->store->dir, O_RDONLY);
-        if (fd < 0 || fsync(fd) < 0)
-            ok = 0;
-        if (fd >= 0)
-            close(fd);
-    }
-    free(path);
-    free(tmp);
+    buf_ulong(&b, (unsigned long)(e->compact.shrinking != 0));
+    buf_puts(&b, ",\"view\":");
+    view_dump(&b, &e->compact);
+    buf_puts(&b, "}\n");
+    result = store_save_file(e->store, "compaction-view.json", &b);
     buf_free(&b);
-    if (!ok)
-        strcpy(e->store->error, "cannot save compaction view");
-    return ok ? 0 : -1;
+    return result;
 }
 
 static int load_compact(Engine *e)
 {
     char *path, *text;
-    Json *j, *p, *a, *entries;
-    unsigned long l, i, end, shrinking;
+    Json *j;
+    unsigned long shrinking, end;
     Ref r;
+    int result;
     path = path_join(e->store->dir, "compaction-view.json");
+    errno = 0;
     text = read_file(path);
     free(path);
     if (!text) {
         if (errno != ENOENT)
-            return -1;
+            return store_fail(e->store, "cannot read compaction-view.json", NULL);
         view_copy(&e->compact, &e->store->view);
         e->compact.shrinking = 1;
         view_shrink(e->store, &e->compact, COMPACT_HIGH, COMPACT_LOW, 0);
@@ -173,40 +150,24 @@ static int load_compact(Engine *e)
     }
     j = json_parse(text);
     free(text);
-    end = 0;
-    entries = json_get(j, "view");
-    if (!j || j->type != J_OBJ || !entries || entries->type != J_ARR ||
-        !json_ulong(json_get(j, "shrinking"), &shrinking) || shrinking > 1)
-        goto bad;
-    for (p = entries->child; p; p = p->next) {
-        a = p->child;
-        if (p->type != J_ARR || !a || !a->next || a->next->next ||
-            !json_ulong(a, &l) || l >= TREE_LEVELS ||
-            !json_ulong(a->next, &i))
-            goto bad;
-        r.l = (unsigned int)l;
-        r.i = i;
-        if (!store_valid_ref(e->store, r) || ref_start(r) != end ||
-            (r.l && !store_node(e->store, r)))
-            goto bad;
-        end += ref_span(r);
-        view_add(&e->compact, r);
-    }
-    while (end < e->store->count) {
-        r.l = 0;
-        r.i = end++;
-        view_add(&e->compact, r);
-    }
+    result = j && j->type == J_OBJ &&
+             json_ulong(json_get(j, "shrinking"), &shrinking) && shrinking <= 1 &&
+             !view_parse(e->store, &e->compact, json_get(j, "view")) ? 0 : -1;
     json_free(j);
+    if (result)
+        return store_fail(e->store, "invalid compaction-view.json; refusing to rebuild it", NULL);
+    end = e->compact.n ? ref_start(e->compact.v[e->compact.n - 1]) +
+                         ref_span(e->compact.v[e->compact.n - 1]) : 0;
+    for (; end < e->store->count; end++) {
+        r.l = 0;
+        r.i = end;
+        view_add(&e->compact, r);
+    }
     view_measure(e->store, &e->compact);
     /* The pending marker is conservative: completing a batch early only
      * changes the small compaction prefix, never the saved turn view. */
     e->compact.shrinking = (int)shrinking || e->compact.bytes > COMPACT_HIGH;
     return 0;
-bad:
-    json_free(j);
-    strcpy(e->store->error, "invalid compaction-view.json; refusing to rebuild it");
-    return -1;
 }
 
 int engine_open(Engine *e, Store *s)
@@ -217,11 +178,8 @@ int engine_open(Engine *e, Store *s)
     memset(e, 0, sizeof(*e));
     e->store = s;
     view_init(&e->compact);
-    if (load_compact(e) < 0) {
-        if (!s->error[0])
-            strcpy(s->error, "cannot load compaction view");
+    if (load_compact(e) < 0)
         return -1;
-    }
     /* One linear startup pass. From here on, completion enqueues parents. */
     for (i = 0; i < s->count; i++) {
         r.l = 0;
@@ -264,14 +222,14 @@ void engine_close(Engine *e)
     memset(e, 0, sizeof(*e));
 }
 
+/* Views are saved only when merges change them or a batch starts or ends:
+ * appended leaves are recovered from the log at the next open. */
 static int update_views(Engine *e)
 {
     int changed, pending, compact_changed, compact_pending;
-    unsigned long old_generation;
     Store *s;
     s = e->store;
     pending = s->view.shrinking;
-    old_generation = s->generation;
     changed = view_shrink(s, &s->view, VIEW_HIGH, VIEW_LOW, 0);
     if (changed) {
         s->generation++;
@@ -279,16 +237,13 @@ static int update_views(Engine *e)
         view_copy(&e->compact, &s->view);
         e->compact.shrinking = 1;
     }
-    if (changed || pending != s->view.shrinking) {
-        if (!store_save_view(s))
-            return -1;
-    }
+    if ((changed || pending != s->view.shrinking) && store_save_view(s) < 0)
+        return -1;
     compact_pending = e->compact.shrinking;
     compact_changed = view_shrink(s, &e->compact, COMPACT_HIGH, COMPACT_LOW, 0);
     if (changed || compact_changed)
         e->deferred_ready = 1;
-    if (old_generation != s->generation || changed || compact_changed ||
-        compact_pending != e->compact.shrinking)
+    if (changed || compact_changed || compact_pending != e->compact.shrinking)
         return save_compact(e);
     return 0;
 }
@@ -304,32 +259,93 @@ int engine_sync(Engine *e)
         ready(e, r);
         view_add(&e->compact, r);
     }
-    if (added) {
-        engine_retry(e);
-        if (update_views(e) < 0 || save_compact(e) < 0)
-            return -1;
-    }
-    return 0;
+    if (!added)
+        return 0;
+    engine_retry(e);
+    return update_views(e);
 }
 
+static void requeue(Engine *e, Job j)
+{
+    store_slot(e->store, j.ref)->queued = NODE_READY;
+    j.retry = 1;
+    enqueue(&e->ready, j);
+}
 void engine_retry(Engine *e)
 {
     Job j;
     while (dequeue(&e->failed, &j)) {
-        store_slot(e->store, j.ref)->queued = 1;
-        j.retry = 1;
-        enqueue(&e->ready, j);
+        j.fails = 0;
+        requeue(e, j);
     }
+}
+
+/* Failed nodes retry by themselves after 15, 60 and 300 seconds, then wait
+ * for a new message or an explicit retry, so a dead provider costs little. */
+int engine_tick(Engine *e, long now)
+{
+    Queue keep;
+    Job j;
+    size_t k;
+    int moved;
+    for (k = e->failed.head; k < e->failed.n; k++)
+        if (e->failed.v[k].fails <= RETRIES && e->failed.v[k].due <= now)
+            break;
+    if (k == e->failed.n)
+        return 0;
+    memset(&keep, 0, sizeof(keep));
+    moved = 0;
+    while (dequeue(&e->failed, &j)) {
+        if (j.fails <= RETRIES && j.due <= now) {
+            requeue(e, j);
+            moved++;
+        } else {
+            enqueue(&keep, j);
+        }
+    }
+    free(e->failed.v);
+    e->failed = keep;
+    return moved;
+}
+
+long engine_deadline(Engine *e, long now)
+{
+    long best;
+    size_t k;
+    best = -1;
+    for (k = e->failed.head; k < e->failed.n; k++)
+        if (e->failed.v[k].fails <= RETRIES &&
+            (best < 0 || e->failed.v[k].due - now < best))
+            best = e->failed.v[k].due > now ? e->failed.v[k].due - now : 0;
+    return best;
 }
 
 int engine_done(Engine *e, Job j, const char *text)
 {
     Ref sibling, parent, leaf;
     Node *n;
-    if (!store_build(e->store, j.ref, text))
+    char *cut;
+    size_t len;
+    int result;
+    /* A node far over the ruler would crowd every later context out of its
+     * 32 KB budget and could never merge away: cut it at a code point. */
+    cut = NULL;
+    if (strlen(text) > NODE_BYTES + NODE_SLACK) {
+        len = utf8_prefix(text, NODE_BYTES);
+        cut = xmalloc(len + 1);
+        memcpy(cut, text, len);
+        cut[len] = 0;
+        text = cut;
+    }
+    result = store_build(e->store, j.ref, text);
+    free(cut);
+    if (result < 0)
         return -1;
+    if (e->built)
+        e->built(e->opaque, j.ref);
     n = store_slot(e->store, j.ref);
-    n->busy = n->queued = 0;
+    n->busy = 0;
+    n->queued = NODE_IDLE;
     if (!j.ref.l && e->inflight)
         e->inflight--;
     sibling = j.ref;
@@ -349,22 +365,80 @@ int engine_done(Engine *e, Job j, const char *text)
     return update_views(e);
 }
 
-void engine_fail(Engine *e, Job j)
+void engine_fail(Engine *e, Job j, long now)
 {
+    static const long backoff[RETRIES] = { 15, 60, 300 };
     Node *n;
     n = store_slot(e->store, j.ref);
     n->busy = 0;
-    n->queued = 2;
+    n->queued = NODE_FAILED;
+    j.fails++;
+    j.due = j.fails <= RETRIES ? now + backoff[j.fails - 1] : 0;
     enqueue(&e->failed, j);
+}
+
+/* A source that fits in a line is its own node, with no model call: a short
+ * message (kind: text) verbatim, two short lines joined by a newline. Sizes
+ * decide; text is read only then. Returns the text, NULL if a model must
+ * build it, or sets *error on a read failure. */
+static char *shortcut(Engine *e, Job j, int *error)
+{
+    Store *s;
+    Node *a, *b;
+    Ref child;
+    char *left, *right;
+    Buf source;
+    s = e->store;
+    *error = 0;
+    buf_init(&source);
+    if (!j.ref.l) {
+        if (s->messages[j.ref.i].has_images ||
+            strlen(store_kind(s, j.ref.i)) + 2 + s->messages[j.ref.i].size > NODE_BYTES)
+            return NULL;
+        left = store_message(s, j.ref.i);
+        if (!left) {
+            *error = 1;
+            return NULL;
+        }
+        buf_puts(&source, store_kind(s, j.ref.i));
+        buf_puts(&source, ": ");
+        buf_puts(&source, left);
+        free(left);
+        return source.s;
+    }
+    child.l = j.ref.l - 1;
+    child.i = j.ref.i * 2;
+    a = store_node(s, child);
+    child.i++;
+    b = store_node(s, child);
+    if (!a || !b) {
+        store_fail(s, "ready merge has an unbuilt child", NULL);
+        *error = 1;
+        return NULL;
+    }
+    if ((unsigned long)a->size + 1 + b->size > NODE_BYTES)
+        return NULL;
+    right = store_text(s, child);
+    child.i--;
+    left = right ? store_text(s, child) : NULL;
+    if (!left) {
+        free(right);
+        *error = 1;
+        return NULL;
+    }
+    buf_puts(&source, left);
+    buf_putc(&source, '\n');
+    buf_puts(&source, right);
+    free(left);
+    free(right);
+    return source.s;
 }
 
 int engine_next(Engine *e, Job *j)
 {
-    Node *n, *a, *b;
-    Ref child;
+    Node *n;
     char *text;
-    Buf source;
-    int have;
+    int have, error;
     for (;;) {
         have = take_deferred(e, j) || dequeue(&e->ready, j);
         if (!have) {
@@ -372,54 +446,26 @@ int engine_next(Engine *e, Job *j)
                 return 0;
         }
         n = store_slot(e->store, j->ref);
-        n->queued = 0;
-        if (n->text || n->busy)
+        n->queued = NODE_IDLE;
+        if (n->size || n->busy)
             continue;
         n->busy = 1;
         if (!j->ref.l && !j->retry)
             e->inflight++;
-        buf_init(&source);
-        if (!j->ref.l) {
-            text = store_message(e->store, j->ref.i);
-            if (!text) {
-                buf_free(&source);
-                return -1;
-            }
-            buf_puts(&source, e->store->messages[j->ref.i].kind);
-            buf_puts(&source, ": ");
-            buf_puts(&source, text);
+        text = shortcut(e, *j, &error);
+        if (error)
+            return -1;
+        if (text) {
+            error = engine_done(e, *j, text);
             free(text);
-        } else {
-            child.l = j->ref.l - 1;
-            child.i = j->ref.i * 2;
-            a = store_node(e->store, child);
-            child.i++;
-            b = store_node(e->store, child);
-            if (!a || !b) {
-                strcpy(e->store->error, "ready merge has an unbuilt child");
-                buf_free(&source);
+            if (error < 0)
                 return -1;
-            }
-            buf_puts(&source, a->text);
-            buf_putc(&source, '\n');
-            buf_puts(&source, b->text);
-        }
-        if (source.len <= NODE_BYTES &&
-            (j->ref.l || !e->store->messages[j->ref.i].has_images)) {
-            if (engine_done(e, *j, source.s) < 0) {
-                buf_free(&source);
-                return -1;
-            }
-            buf_free(&source);
             continue;
         }
-        buf_free(&source);
-        text = engine_context(e, *j);
-        if (!text) {
+        if (!fits(e, *j)) {
             defer(e, *j);
             continue;
         }
-        free(text);
         return 1;
     }
 }
@@ -429,7 +475,6 @@ char *engine_task(Engine *e, Job j)
     Buf b;
     char *text;
     Ref a;
-    Node *n;
     size_t k;
     buf_init(&b);
     if (!j.ref.l) {
@@ -464,19 +509,22 @@ char *engine_task(Engine *e, Job j)
             buf_free(&b);
             return NULL;
         }
-        buf_puts(&b, e->store->messages[j.ref.i].kind);
+        buf_puts(&b, store_kind(e->store, j.ref.i));
         buf_puts(&b, ": ");
         buf_puts(&b, text);
         free(text);
     } else {
         a.l = j.ref.l - 1;
-        a.i = j.ref.i * 2;
-        n = store_node(e->store, a);
-        buf_puts(&b, n->text);
-        buf_putc(&b, '\n');
-        a.i++;
-        n = store_node(e->store, a);
-        buf_puts(&b, n->text);
+        for (a.i = j.ref.i * 2; a.i <= j.ref.i * 2 + 1; a.i++) {
+            text = store_text(e->store, a);
+            if (!text) {
+                buf_free(&b);
+                return NULL;
+            }
+            buf_puts(&b, text);
+            buf_puts(&b, a.i & 1 ? "" : "\n");
+            free(text);
+        }
     }
     buf_puts(&b, "\n</input>");
     return b.s;
@@ -484,9 +532,7 @@ char *engine_task(Engine *e, Job j)
 
 char *engine_context(Engine *e, Job j)
 {
-    unsigned long end;
-    end = context_end(j);
-    return view_render_limit(e->store, &e->compact, end, 1, COMPACT_HIGH);
+    return view_render(e->store, &e->compact, context_end(j), 1, COMPACT_HIGH);
 }
 
 int engine_caught_up(Engine *e, unsigned long before)

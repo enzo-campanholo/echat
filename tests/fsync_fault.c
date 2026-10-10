@@ -1,6 +1,6 @@
 /* Inject storage faults without changing production code or using a loader. */
 #undef fsync
-#undef fopen
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,14 +8,34 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static unsigned long syncs;
+
+static int is_target(int fd, const char *variable)
+{
+    const char *path;
+    struct stat file, target;
+    path = getenv(variable);
+    return path && fstat(fd, &file) == 0 && stat(path, &target) == 0 &&
+           file.st_dev == target.st_dev && file.st_ino == target.st_ino;
+}
+
+/* UNII_TEST_SYNC_COUNT names a file that receives the number of fsyncs. */
+static void report(void)
+{
+    FILE *f;
+    f = fopen(getenv("UNII_TEST_SYNC_COUNT"), "w");
+    if (f) {
+        fprintf(f, "%lu\n", syncs);
+        fclose(f);
+    }
+}
+
 int unii_test_fsync(int fd)
 {
     static int failed;
-    const char *path;
-    struct stat file, target;
-    path = getenv("UNII_TEST_FSYNC_PATH");
-    if (!failed && path && fstat(fd, &file) == 0 && stat(path, &target) == 0 &&
-        file.st_dev == target.st_dev && file.st_ino == target.st_ino) {
+    if (!syncs++ && getenv("UNII_TEST_SYNC_COUNT"))
+        atexit(report);
+    if (!failed && is_target(fd, "UNII_TEST_FSYNC_PATH")) {
         failed = 1;
         errno = EIO;
         return -1;
@@ -23,14 +43,3 @@ int unii_test_fsync(int fd)
     return fsync(fd);
 }
 
-FILE *unii_test_fopen(const char *path, const char *mode)
-{
-    static unsigned int reads;
-    const char *target;
-    target = getenv("UNII_TEST_READ_PATH");
-    if (target && !strcmp(path, target) && !strcmp(mode, "rb") && ++reads == 2) {
-        errno = EIO;
-        return NULL;
-    }
-    return fopen(path, mode);
-}

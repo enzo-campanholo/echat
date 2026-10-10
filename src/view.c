@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define PLACEHOLDER "(not summarized yet: zoom it)"
+
 void view_init(View *v)
 {
     memset(v, 0, sizeof(*v));
@@ -21,10 +23,6 @@ void view_add(View *v, Ref r)
             exit(1);
         }
         v->cap = v->cap ? v->cap * 2 : 32;
-        if (v->cap > (size_t)-1 / sizeof(*v->v)) {
-            fputs("unii: view is too large\n", stderr);
-            exit(1);
-        }
         v->v = xrealloc(v->v, v->cap * sizeof(*v->v));
     }
     v->v[v->n++] = r;
@@ -42,64 +40,138 @@ void view_copy(View *to, const View *from)
     to->shrinking = from->shrinking;
 }
 
-static void line(Buf *b, Ref r, const Node *n)
+void view_dump(Buf *b, const View *v)
+{
+    size_t i;
+    buf_putc(b, '[');
+    for (i = 0; i < v->n; i++) {
+        if (i)
+            buf_putc(b, ',');
+        buf_putc(b, '[');
+        buf_ulong(b, v->v[i].l);
+        buf_putc(b, ',');
+        buf_ulong(b, v->v[i].i);
+        buf_putc(b, ']');
+    }
+    buf_putc(b, ']');
+}
+
+int view_parse(Store *s, View *v, const Json *j)
+{
+    const Json *p;
+    unsigned long l, i, end;
+    Ref r;
+    end = 0;
+    if (!j || j->type != J_ARR)
+        return store_fail(s, "view must be an array of [level,index] pairs", NULL);
+    for (p = j->child; p; p = p->next) {
+        if (p->type != J_ARR || !p->child || !p->child->next ||
+            p->child->next->next || !json_ulong(p->child, &l) ||
+            l >= TREE_LEVELS || !json_ulong(p->child->next, &i))
+            return store_fail(s, "invalid saved view pair", NULL);
+        r.l = (unsigned int)l;
+        r.i = i;
+        if (!store_valid_ref(s, r) || ref_start(r) != end ||
+            (r.l && !store_node(s, r)))
+            return store_fail(s, "saved view has a gap, overlap, or unbuilt parent", NULL);
+        end += ref_span(r);
+        view_add(v, r);
+    }
+    return 0;
+}
+
+void view_line(Buf *b, Ref r, const char *text)
 {
     const char *p;
     buf_ulong(b, ref_start(r));
     buf_putc(b, '+');
     buf_ulong(b, ref_span(r));
     buf_putc(b, '|');
-    p = n ? n->text : "(not summarized yet: zoom it)";
+    p = text ? text : PLACEHOLDER;
     for (; *p; p++)
         buf_putc(b, (*p == '\n' || *p == '\r') ? ' ' : *p);
     buf_putc(b, '\n');
 }
 
-/* Open only the node crossing the cutoff. Its children already exist; this
- * preserves the saved view's merges and never exposes a later message. */
-static int prefix_line(Store *s, Buf *b, Ref r, unsigned long end, int built_only,
-                       size_t limit)
+/* The bytes view_line writes for a node, from its size alone. */
+static size_t line_size(Store *s, Ref r)
 {
-    Node *n;
+    Node *node;
+    unsigned long id, n;
+    size_t size;
+    node = store_node(s, r);
+    size = node ? node->size : sizeof(PLACEHOLDER) - 1;
+    size += 3; /* +, |, LF */
+    id = ref_start(r);
+    n = ref_span(r);
+    do { size++; id /= 10; } while (id);
+    do { size++; n /= 10; } while (n);
+    return size;
+}
+
+/* Visit the prefix's lines before END: open only the node crossing END. Its
+ * children exist; this keeps the saved view's merges and never exposes a
+ * later message. built_only stops at the first unbuilt line. Returns 0 to
+ * stop, -1 on a read error. With B, render; otherwise add sizes to *bytes. */
+static int prefix(Store *s, Ref r, unsigned long end, int built_only, Buf *b,
+                  size_t *bytes)
+{
     Ref child;
     unsigned long start;
+    char *text;
+    int k;
     start = ref_start(r);
     if (start >= end)
         return 0;
     if (ref_span(r) > end - start) {
         child.l = r.l - 1;
         child.i = r.i * 2;
-        if (!prefix_line(s, b, child, end, built_only, limit))
-            return 0;
+        k = prefix(s, child, end, built_only, b, bytes);
+        if (k <= 0)
+            return k;
         child.i++;
-        return prefix_line(s, b, child, end, built_only, limit);
+        return prefix(s, child, end, built_only, b, bytes);
     }
-    n = store_node(s, r);
-    if (!n && built_only)
-        return 0;
-    line(b, r, n);
-    return !limit || b->len <= limit - 8; /* reserve </chat>\n */
+    if (!store_node(s, r)) {
+        if (built_only)
+            return 0;
+        if (b)
+            view_line(b, r, NULL);
+    } else if (b) {
+        text = store_text(s, r);
+        if (!text)
+            return -1;
+        view_line(b, r, text);
+        free(text);
+    }
+    if (!b)
+        *bytes += line_size(s, r);
+    return 1;
 }
 
-char *view_render(Store *s, View *v, unsigned long end, int built_only)
+size_t view_prefix(Store *s, View *v, unsigned long end, int built_only)
 {
-    return view_render_limit(s, v, end, built_only, 0);
+    size_t i, bytes;
+    bytes = sizeof("<chat>\n</chat>\n") - 1;
+    for (i = 0; i < v->n; i++)
+        if (prefix(s, v->v[i], end, built_only, NULL, &bytes) <= 0)
+            break;
+    return bytes;
 }
 
-char *view_render_limit(Store *s, View *v, unsigned long end, int built_only,
-                       size_t limit)
+char *view_render(Store *s, View *v, unsigned long end, int built_only,
+                  size_t limit)
 {
     Buf b;
     size_t i;
-    if (limit && limit < 15)
+    int k;
+    if (limit && view_prefix(s, v, end, built_only) > limit)
         return NULL;
     buf_init(&b);
     buf_puts(&b, "<chat>\n");
-    for (i = 0; i < v->n; i++) {
-        if (!prefix_line(s, &b, v->v[i], end, built_only, limit))
-            break;
-    }
-    if (limit && b.len > limit - 8) {
+    for (i = 0, k = 1; k > 0 && i < v->n; i++)
+        k = prefix(s, v->v[i], end, built_only, &b, NULL);
+    if (k < 0) {
         buf_free(&b);
         return NULL;
     }
@@ -110,17 +182,9 @@ char *view_render_limit(Store *s, View *v, unsigned long end, int built_only,
 size_t view_measure(Store *s, View *v)
 {
     size_t k, size, bytes;
-    unsigned long id, n;
-    Node *node;
-    bytes = 15; /* <chat>\n and </chat>\n */
+    bytes = sizeof("<chat>\n</chat>\n") - 1;
     for (k = 0; k < v->n; k++) {
-        node = store_node(s, v->v[k]);
-        size = node ? node->size : sizeof("(not summarized yet: zoom it)") - 1;
-        size += 3; /* +, |, LF */
-        id = ref_start(v->v[k]);
-        n = ref_span(v->v[k]);
-        do { size++; id /= 10; } while (id);
-        do { size++; n /= 10; } while (n);
+        size = line_size(s, v->v[k]);
         if (size > (size_t)-1 - bytes) {
             fputs("unii: view size overflow\n", stderr);
             exit(1);

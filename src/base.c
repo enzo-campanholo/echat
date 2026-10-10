@@ -1,7 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
+/* Darwin hides F_FULLFSYNC from strict POSIX builds. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 #include "base.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +14,6 @@
 #include <unistd.h>
 
 #define JSON_DEPTH 128
-#define ECHO_HALF 15000
 
 static void oom(void)
 {
@@ -39,8 +43,6 @@ char *xstrdup(const char *s)
     size_t n;
     char *p;
     n = strlen(s);
-    if (n == (size_t)-1)
-        oom();
     p = xmalloc(n + 1);
     memcpy(p, s, n + 1);
     return p;
@@ -82,23 +84,16 @@ static void buf_reserve(Buf *b, size_t n)
     b->cap = cap;
 }
 
+/* s must not point into b: growing b may move it. */
 void buf_add(Buf *b, const void *s, size_t n)
 {
-    char *copy;
     if (n > (size_t)-1 - b->len - 1)
         oom();
-    copy = NULL;
-    if (n && s == b->s) {
-        copy = xmalloc(n);
-        memcpy(copy, s, n);
-        s = copy;
-    }
     buf_reserve(b, b->len + n + 1);
     if (n)
-        memmove(b->s + b->len, s, n);
+        memcpy(b->s + b->len, s, n);
     b->len += n;
     b->s[b->len] = 0;
-    free(copy);
 }
 
 void buf_puts(Buf *b, const char *s)
@@ -155,10 +150,14 @@ void buf_json(Buf *b, const char *s)
 
 int read_line(FILE *f, Buf *b)
 {
+    char chunk[512];
+    size_t n;
     int c;
     buf_reset(b);
-    while ((c = fgetc(f)) != EOF) {
+    n = 0;
+    while ((c = getc(f)) != EOF) {
         if (c == '\n') {
+            buf_add(b, chunk, n);
             buf_add(b, "", 0);
             return 1;
         }
@@ -166,8 +165,13 @@ int read_line(FILE *f, Buf *b)
             errno = EINVAL;
             return -1;
         }
-        buf_putc(b, c);
+        chunk[n++] = (char)c;
+        if (n == sizeof(chunk)) {
+            buf_add(b, chunk, n);
+            n = 0;
+        }
     }
+    buf_add(b, chunk, n);
     if (ferror(f)) {
         if (!errno)
             errno = EIO;
@@ -236,6 +240,18 @@ int write_all(int fd, const void *data, size_t n)
         n -= (size_t)wrote;
     }
     return 0;
+}
+
+/* fsync is no barrier on macOS: only F_FULLFSYNC flushes the drive cache.
+ * Filesystems without it (some network mounts) fall back to fsync.
+ * UNII_PLAIN_FSYNC (fault-injection builds only) always calls fsync. */
+int sync_fd(int fd)
+{
+#if defined(F_FULLFSYNC) && !defined(UNII_PLAIN_FSYNC)
+    if (fcntl(fd, F_FULLFSYNC) == 0)
+        return 0;
+#endif
+    return fsync(fd);
 }
 
 /* Return the width of one scalar value, or zero for malformed input. */
@@ -307,15 +323,15 @@ int utf8_valid(const char *s)
     return 1;
 }
 
-char *clip_echo(const char *s)
+char *clip_echo(const char *s, size_t chars)
 {
     static const char marker[] = "\n[... output clipped ...]\n";
     const char *p, *head, *tail;
     size_t width, count, skip, head_count, tail_count;
     Buf b;
     count = 0;
-    head_count = (ECHO_HALF * 2 - (sizeof(marker) - 1)) / 2;
-    tail_count = ECHO_HALF * 2 - (sizeof(marker) - 1) - head_count;
+    head_count = (chars - (sizeof(marker) - 1)) / 2;
+    tail_count = chars - (sizeof(marker) - 1) - head_count;
     head = s;
     for (p = s; *p; p += width) {
         width = utf8_char(p, 4, NULL);
@@ -327,7 +343,7 @@ char *clip_echo(const char *s)
         if (count == head_count)
             head = p + width;
     }
-    if (count <= ECHO_HALF * 2)
+    if (count <= chars)
         return xstrdup(s);
     skip = count - tail_count;
     tail = s;
@@ -453,24 +469,30 @@ static char *string(Parser *p)
 {
     Buf b;
     unsigned long c, low;
+    const char *run;
     size_t width;
     int ch;
     if (*p->p != '"')
         return NULL;
     p->p++;
     buf_init(&b);
-    while (*p->p && *p->p != '"') {
-        ch = (unsigned char)*p->p;
-        if (ch < 32)
-            goto bad;
-        if (ch != '\\') {
+    for (;;) {
+        /* Copy a run of plain bytes at once, validating UTF-8 as it goes. */
+        for (run = p->p; (unsigned char)*p->p >= 32 && *p->p != '"' && *p->p != '\\';) {
+            if ((unsigned char)*p->p < 128) {
+                p->p++;
+                continue;
+            }
             width = utf8_char(p->p, 4, NULL);
             if (!width)
                 goto bad;
-            buf_add(&b, p->p, width);
             p->p += width;
-            continue;
         }
+        buf_add(&b, run, (size_t)(p->p - run));
+        if (*p->p == '"')
+            break;
+        if (*p->p != '\\')
+            goto bad; /* NUL or a control character */
         p->p++;
         ch = (unsigned char)*p->p;
         if (!ch)
@@ -504,8 +526,6 @@ static char *string(Parser *p)
         default: goto bad;
         }
     }
-    if (*p->p != '"')
-        goto bad;
     p->p++;
     buf_add(&b, "", 0);
     return b.s;
