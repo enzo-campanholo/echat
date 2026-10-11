@@ -17,7 +17,7 @@
 
 static void oom(void)
 {
-    fputs("uniichat: out of memory\n", stderr);
+    fputs("unii: out of memory\n", stderr);
     exit(1);
 }
 

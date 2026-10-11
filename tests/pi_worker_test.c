@@ -1,4 +1,4 @@
-/* Real pi performs the engine's compaction calls in-process (B1). */
+/* Real pi performs the engine's compaction calls in-process. */
 #define _POSIX_C_SOURCE 200809L
 #include "store.h"
 #include <assert.h>

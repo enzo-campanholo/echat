@@ -49,14 +49,15 @@ served while they wait.
 ### hello
 
 `{"id":1,"op":"hello","protocol":1}` ->
-`{"id":1,"ok":true,"protocol":1,"messages":N,"summarized":C,"provider":P,"model":M,"effort":E}`
+`{"id":1,"ok":true,"protocol":1,"messages":N,"summarized":C,"summary_provider":P,"summary_model":M,"summary_effort":E}`
 
 Starts model work and enables events. Until `hello`, the engine logs and
 answers reads but asks for no model calls. `messages` is the number of
 messages in the log; `summarized` the length of the prefix whose leaves are
-built. `provider`, `model` and `effort` are the summary model chosen by
-`unii serve --provider/--model/--effort` (defaults `openai-codex`,
-`gpt-6-luna`, `xhigh`, or `UNII_COMPACT_PROVIDER`/`_MODEL`/`_EFFORT`).
+built. The `summary_` fields name the model that writes summaries:
+`unii serve --provider/--model/--effort`, else `UNII_PROVIDER`,
+`UNII_MODEL` and `UNII_EFFORT`, else `openai-codex`, `gpt-6-luna` and
+`xhigh`. (Each `call` event names its own.)
 
 `configure` is the protocol-0 form: it also starts model work, enables
 events only if `"events":true`, and ignores its old `system`, `tools` and
@@ -73,7 +74,7 @@ Logs `text` (and optional image blocks) as a `user` message, then waits
 until every earlier message is summarized and the view rendered before the
 new message fits in 128,000 bytes. The response's `view` is that rendering:
 the host sends it, then the message, in a fresh model context. Errors (the
-input stays logged; the next message retries): a summary failed or is
+input stays logged; the next `user` message retries): a summary failed or is
 blocked, or the view cannot fit.
 
 One `turn` or `flush` waits at a time. A `turn` that arrives while a
@@ -171,12 +172,14 @@ re-validated against the log; an unreadable one is fatal.
 
 Retries every failed node now, without logging a message. Failed nodes also
 retry by themselves 15, 60 and 300 seconds after each failure, then wait
-for a new message or `retry`, which restart that schedule.
+for a new message of kind `user` (a `turn`, `steer` or `append`) or
+`retry`, which restart that schedule. Other kinds (replies, tool calls and
+results, reports, notes) never do: a busy turn writes hundreds of them.
 
 ### status
 
 `{"id":7,"op":"status"}` ->
-`{"id":7,"ok":true,"messages":N,"summarized":C,"view_bytes":B,"lines":L,"workers":W,"failed":F,"blocked":K,"summary_provider":P,"summary_model":M}`
+`{"id":7,"ok":true,"messages":N,"summarized":C,"view_bytes":B,"lines":L,"workers":W,"failed":F,"blocked":K,"summary_provider":P,"summary_model":M,"summary_effort":E}`
 
 ### shutdown
 
@@ -219,7 +222,8 @@ ignored; it is not fatal.
 ### event cancel
 
 `{"event":"cancel","call":N}`: the call exceeded `unii serve --timeout`
-(default 300 seconds, monotonic clock). Abort it; its result is refused.
+(or `UNII_TIMEOUT`; default 300 seconds, monotonic clock). Abort it; its
+result is refused.
 
 ### event error
 

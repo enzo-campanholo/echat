@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 umask 077
+# The engine reads its summary model and timeout from these; tests set their own.
+unset UNII_PROVIDER UNII_MODEL UNII_EFFORT UNII_TIMEOUT
 task_dir=${TMPDIR:-/tmp}/uniichat-test-$$
 mkdir "$task_dir"
 trap 'rm -rf "$task_dir"' 0 HUP INT TERM
@@ -31,6 +33,11 @@ grep -q '^{"i":0,"kind":"note","text":"Imported verbatim.\\n",' "$task_dir/log"
 ./unii prompt > "$task_dir/prompt"
 grep -q "^not summarized yet follow the view whole, inside <recent> tags." "$task_dir/prompt"
 ! grep -q "shows as \"(not summarized yet" "$task_dir/prompt"
+# The prompt is built in byte for byte, apart from those two lines, and
+# needs no file at run time.
+test "$(diff pi/prompt.txt "$task_dir/prompt" | grep -c '^[<>]')" -eq 4
+here=$(pwd)
+(cd "$task_dir" && "$here/unii" prompt) | cmp -s - "$task_dir/prompt"
 if ./unii add "$task_dir/import" thought </dev/null 2>/dev/null; then
     echo 'thoughts must not be logged' >&2
     exit 1
@@ -44,4 +51,26 @@ for args in "view $typo" "status $typo" "zoom $typo 0 1" "date $typo 0" "log $ty
     fi
 done
 test ! -e "$typo"
-printf 'integration: piped requests at end of input, CLI import, zoom, date, log, read-only commands, thought rejection OK\n'
+# Usage errors are checked before a chat is opened: none creates one.
+for args in "add $typo" "add $typo thought" "frobnicate $typo" "view $typo extra" \
+    "zoom $typo 0" "log $typo" "prompt extra"; do
+    status=0
+    ./unii $args </dev/null >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 2 ]; then
+        echo "unii $args exited $status, not as a usage error" >&2
+        exit 1
+    fi
+done
+test ! -e "$typo"
+# The summary model: a flag overrides the environment, which overrides the default.
+printf '{"id":1,"op":"hello","protocol":1}\n' | UNII_PROVIDER=env-provider UNII_MODEL=env-model \
+    UNII_EFFORT=low ./unii serve "$task_dir/env" --effort high > "$task_dir/env.out"
+grep -q '"summary_provider":"env-provider","summary_model":"env-model","summary_effort":"high"}$' \
+    "$task_dir/env.out"
+status=0
+UNII_TIMEOUT=0 ./unii serve "$task_dir/env" </dev/null 2>/dev/null || status=$?
+test "$status" -eq 2
+# A closed standard descriptor is never reused by a chat file.
+printf '{"id":1,"op":"status"}\n' | ./unii serve "$task_dir/closed" >&-
+test ! -s "$task_dir/closed/.lock"
+printf 'integration: piped requests at end of input, CLI import, zoom, date, log, read-only commands, usage errors, summary settings, thought rejection OK\n'

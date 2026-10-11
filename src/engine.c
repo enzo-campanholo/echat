@@ -248,20 +248,25 @@ static int update_views(Engine *e)
     return 0;
 }
 
+/* The user's words retry failed work at once; the agent's own records do
+ * not, or one busy turn would repeat a failing call hundreds of times. */
 int engine_sync(Engine *e)
 {
     Ref r;
-    int added;
+    int added, user;
     added = e->seen < e->store->count;
+    user = 0;
     while (e->seen < e->store->count) {
         r.l = 0;
         r.i = e->seen++;
+        user |= e->store->messages[r.i].kind == KIND_USER;
         ready(e, r);
         view_add(&e->compact, r);
     }
     if (!added)
         return 0;
-    engine_retry(e);
+    if (user)
+        engine_retry(e);
     return update_views(e);
 }
 

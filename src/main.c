@@ -1,5 +1,6 @@
 #include "engine.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -7,13 +8,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef UNII_ASSETS
-#define UNII_ASSETS "pi"
-#endif
-
 #define PROTOCOL 1
 #define SPEC_PENDING "A\nmessage not summarized yet shows as \"(not summarized yet: zoom it)\"."
 #define TAIL_PENDING "Messages\nnot summarized yet follow the view whole, inside <recent> tags."
+
+/* pi/prompt.txt, built in one string per line (see the Makefile). */
+static const char *const prompt[] = {
+#include "prompt.h"
+    NULL
+};
 
 /* One outstanding model call per slot. The host performs it statelessly:
  * each attempt resends the whole conversation, corrections included. */
@@ -205,6 +208,14 @@ static int running(Server *s)
     return n;
 }
 
+/* The summary model, as hello and status report it (calls name their own). */
+static void summary_model(Buf *b, const Server *s)
+{
+    key_str(b, "summary_provider", s->provider);
+    key_str(b, "summary_model", s->model);
+    key_str(b, "summary_effort", s->effort);
+}
+
 static void status(Server *s, const Json *req)
 {
     Buf b;
@@ -216,10 +227,8 @@ static void status(Server *s, const Json *req)
     key_ulong(&b, "workers", (unsigned long)running(s));
     key_ulong(&b, "failed", (unsigned long)(s->engine.failed.n - s->engine.failed.head));
     key_ulong(&b, "blocked", (unsigned long)s->engine.deferred.n);
-    if (s->model) {
-        key_str(&b, "summary_provider", s->provider);
-        key_str(&b, "summary_model", s->model);
-    }
+    if (s->model) /* serving, not a CLI reader */
+        summary_model(&b, s);
     finish(&b);
 }
 
@@ -700,35 +709,37 @@ static int step(Server *s)
     engine_tick(&s->engine, now);
     for (k = 0; s->ready && k < WORKERS; k++) {
         c = &s->calls[k];
-        if (c->id)
-            continue;
-        next = engine_next(&s->engine, &c->job);
-        if (next < 0)
-            return -1;
-        if (!next)
-            break;
-        if (start_call(s, c) < 0)
-            return -1;
+        while (!c->id) { /* a job that cannot start frees its slot again */
+            next = engine_next(&s->engine, &c->job);
+            if (next < 0)
+                return -1;
+            if (!next)
+                return settle_pending(s);
+            if (start_call(s, c) < 0)
+                return -1;
+        }
     }
     return settle_pending(s);
 }
 
-/* Milliseconds until the earliest call deadline, at most one second (which
- * also bounds the latency of automatic retries). */
+/* Milliseconds until the next call deadline or automatic retry; -1 (wait
+ * for input) if there is none. Only these and requests change any state. */
 static int deadline(Server *s)
 {
     long now, left, best;
     int k;
     now = seconds();
-    best = 1;
+    best = engine_deadline(&s->engine, now);
     for (k = 0; k < WORKERS; k++) {
         if (!s->calls[k].id)
             continue;
         left = s->calls[k].started + s->timeout + 1 - now;
-        if (left < best)
-            best = left > 0 ? left : 0;
+        if (left < 0)
+            left = 0;
+        if (best < 0 || left < best)
+            best = left;
     }
-    return (int)best * 1000;
+    return best < 0 ? -1 : (int)best * 1000;
 }
 
 static void hello(Server *s, const Json *req)
@@ -739,9 +750,7 @@ static void hello(Server *s, const Json *req)
     key_ulong(&b, "protocol", PROTOCOL);
     key_ulong(&b, "messages", s->store.count);
     key_ulong(&b, "summarized", s->engine.contiguous);
-    key_str(&b, "provider", s->provider);
-    key_str(&b, "model", s->model);
-    key_str(&b, "effort", s->effort);
+    summary_model(&b, s);
     finish(&b);
 }
 
@@ -1007,6 +1016,28 @@ static int serve(Server *s)
     return result;
 }
 
+/* The spec's prompt; C2 rewords one sentence. */
+static int print_prompt(void)
+{
+    Buf b;
+    const char *at;
+    size_t k;
+    buf_init(&b);
+    buf_add(&b, "", 0);
+    for (k = 0; prompt[k]; k++)
+        buf_puts(&b, prompt[k]);
+    at = strstr(b.s, SPEC_PENDING);
+    if (TAIL_BYTES && at) {
+        fwrite(b.s, 1, (size_t)(at - b.s), stdout);
+        fputs(TAIL_PENDING, stdout);
+        fputs(at + strlen(SPEC_PENDING), stdout);
+    } else {
+        fputs(b.s, stdout);
+    }
+    buf_free(&b);
+    return fflush(stdout) == EOF || ferror(stdout) ? 1 : 0;
+}
+
 static void usage(void)
 {
     fputs("usage: unii prompt\n"
@@ -1029,6 +1060,8 @@ static char *stdin_text(void)
     while ((n = fread(chunk, 1, sizeof(chunk), stdin)) != 0)
         buf_add(&b, chunk, n);
     if (ferror(stdin) || (b.s && memchr(b.s, 0, b.len))) {
+        if (!ferror(stdin))
+            errno = EINVAL;
         buf_free(&b);
         return NULL;
     }
@@ -1047,55 +1080,81 @@ static int number(const char *text, unsigned long *n)
     return ok;
 }
 
+/* Seconds per call: 1 to 86400. */
+static int timeout_arg(const char *text, long *timeout)
+{
+    unsigned long n;
+    if (!number(text, &n) || !n || n > 86400)
+        return 0;
+    *timeout = (long)n;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     Server s;
     Entry entry;
     Ref leaf;
-    char *path, *text;
-    const char *command, *assets, *at;
+    char *text;
+    const char *command, *source;
     unsigned long id, n, page;
     Job job;
-    int k, result, next, writer;
+    int k, fd, result, next, writer;
+    /* A closed standard descriptor would be reused by a chat file, and
+     * output meant for it would land in that file. */
+    do
+        fd = open("/dev/null", O_RDWR);
+    while (fd >= 0 && fd <= STDERR_FILENO);
+    if (fd >= 0)
+        close(fd);
     memset(&s, 0, sizeof(s));
     if (argc < 2) { usage(); return 2; }
     command = argv[1];
-    assets = env_default("UNII_ASSETS", UNII_ASSETS);
     if (!strcmp(command, "prompt")) {
-        path = path_join(assets, "prompt.txt");
-        text = read_file(path);
-        free(path);
-        if (!text) { perror("unii: prompt.txt"); return 1; }
-        /* prompt.txt is the spec's prompt; C2 rewords one sentence. */
-        at = strstr(text, SPEC_PENDING);
-        if (TAIL_BYTES && at) {
-            fwrite(text, 1, (size_t)(at - text), stdout);
-            fputs(TAIL_PENDING, stdout);
-            fputs(at + strlen(SPEC_PENDING), stdout);
-        } else {
-            fputs(text, stdout);
-        }
-        free(text);
-        return 0;
+        if (argc != 2) { usage(); return 2; }
+        return print_prompt();
     }
+    /* Every argument is checked before a chat is opened: a mistyped command
+     * never creates, locks or reads one. */
     if (argc < 3) { usage(); return 2; }
+    id = page = 0;
+    n = ULONG_MAX;
     if (!strcmp(command, "serve")) {
-        s.model = env_default("UNII_COMPACT_MODEL", "gpt-6-luna");
-        s.provider = env_default("UNII_COMPACT_PROVIDER", "openai-codex");
-        s.effort = env_default("UNII_COMPACT_EFFORT", "xhigh");
+        /* The summary model's defaults live only here; flags override the
+         * environment. */
+        s.model = env_default("UNII_MODEL", "gpt-6-luna");
+        s.provider = env_default("UNII_PROVIDER", "openai-codex");
+        s.effort = env_default("UNII_EFFORT", "xhigh");
         s.timeout = 300;
+        source = env_default("UNII_TIMEOUT", NULL);
+        if (source && !timeout_arg(source, &s.timeout)) {
+            fputs("unii: UNII_TIMEOUT must be 1 to 86400 seconds\n", stderr);
+            return 2;
+        }
         for (k = 3; k < argc; k += 2) {
             if (k + 1 >= argc) { usage(); return 2; }
             if (!strcmp(argv[k], "--model")) s.model = argv[k + 1];
             else if (!strcmp(argv[k], "--provider")) s.provider = argv[k + 1];
             else if (!strcmp(argv[k], "--effort")) s.effort = argv[k + 1];
-            else if (!strcmp(argv[k], "--timeout") && number(argv[k + 1], &n) &&
-                     n && n <= 86400) s.timeout = (long)n;
-            else { usage(); return 2; }
+            else if (strcmp(argv[k], "--timeout") || !timeout_arg(argv[k + 1], &s.timeout)) {
+                usage();
+                return 2;
+            }
         }
-    }
-    if (!strcmp(command, "log")) {
-        n = ULONG_MAX;
+    } else if (!strcmp(command, "add")) {
+        if (argc > 5) { usage(); return 2; }
+        if (argc < 4 || store_kind_id(argv[3]) < 0) {
+            fputs("unii: KIND is user, unii, tool, echo, work or note\n", stderr);
+            return 2;
+        }
+    } else if (!strcmp(command, "view") || !strcmp(command, "status")) {
+        if (argc != 3) { usage(); return 2; }
+    } else if (!strcmp(command, "zoom")) {
+        if (argc < 5 || argc > 6 || !number(argv[3], &id) || !number(argv[4], &n) ||
+            (argc == 6 && !number(argv[5], &page))) { usage(); return 2; }
+    } else if (!strcmp(command, "date")) {
+        if (argc != 4 || !number(argv[3], &id)) { usage(); return 2; }
+    } else if (!strcmp(command, "log")) {
         if (argc < 4 || argc > 5 || !number(argv[3], &id) ||
             (argc == 5 && !number(argv[4], &n))) { usage(); return 2; }
         result = store_log(&s.store, argv[2], id, n, stdout);
@@ -1103,12 +1162,25 @@ int main(int argc, char **argv)
             fprintf(stderr, "unii: %s\n", s.store.error);
         store_close(&s.store);
         return result < 0 ? 1 : 0;
+    } else {
+        usage();
+        return 2;
+    }
+    text = NULL;
+    if (!strcmp(command, "add")) {
+        source = argc == 5 && strcmp(argv[4], "-") ? argv[4] : NULL;
+        text = source ? read_file(source) : stdin_text();
+        if (!text) {
+            fprintf(stderr, "unii: %s: %s\n", source ? source : "stdin", strerror(errno));
+            return 1;
+        }
     }
     /* Only serve and add write; every other command reads without the lock. */
     writer = !strcmp(command, "serve") || !strcmp(command, "add");
     if ((writer ? store_open(&s.store, argv[2]) : store_open_read(&s.store, argv[2])) < 0) {
         fprintf(stderr, "unii: %s\n", s.store.error);
         store_close(&s.store);
+        free(text);
         return 1;
     }
     result = 0;
@@ -1122,9 +1194,6 @@ int main(int argc, char **argv)
         }
         engine_close(&s.engine);
     } else if (!strcmp(command, "add")) {
-        if (argc < 4 || argc > 5) { usage(); result = -1; goto done; }
-        text = argc == 5 && strcmp(argv[4], "-") ? read_file(argv[4]) : stdin_text();
-        if (!text) { perror("unii: input"); result = -1; goto done; }
         entry.kind = argv[3];
         entry.text = text;
         entry.images = NULL;
@@ -1147,27 +1216,20 @@ int main(int argc, char **argv)
         if (!text) result = -1;
         else { fputs(text, stdout); free(text); }
     } else if (!strcmp(command, "zoom")) {
-        page = 0;
-        if (argc < 5 || argc > 6 || !number(argv[3], &id) || !number(argv[4], &n) ||
-            (argc == 6 && !number(argv[5], &page))) {
-            usage(); result = -1; goto done;
-        }
         text = store_zoom(&s.store, id, n, page, NULL);
         if (!text) result = -1;
         else { puts(text); free(text); }
     } else if (!strcmp(command, "date")) {
-        if (argc != 4 || !number(argv[3], &id)) { usage(); result = -1; goto done; }
         text = store_date(&s.store, id);
         if (!text) result = -1;
         else { puts(text); free(text); }
-    } else if (!strcmp(command, "status")) {
+    } else {
         s.engine.store = &s.store;
         leaf.l = 0;
         for (leaf.i = 0; leaf.i < s.store.count && store_node(&s.store, leaf); leaf.i++)
             s.engine.contiguous++;
         status(&s, NULL);
-    } else { usage(); result = -1; }
-done:
+    }
     if (result < 0 && s.store.error[0])
         fprintf(stderr, "unii: %s\n", s.store.error);
     store_close(&s.store);

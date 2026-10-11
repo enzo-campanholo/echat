@@ -1,5 +1,6 @@
 /unii
 /src/*.o
+/src/prompt.h
 /tests/base_test
 /tests/store_test
 /tests/view_test

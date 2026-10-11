@@ -1,7 +1,7 @@
 /* Unit tests for the JS adapter, run as a pi extension (pi has no plain
  * script mode here). It exits 0 on success before pi reads any input. */
 import { EventEmitter } from "node:events";
-import { chatBlocks, cachePayload, Calls, Records, wellFormed } from "../pi/common.mjs";
+import { chatBlocks, cachePayload, Calls, Records, imageBlocks, wellFormed } from "../pi/common.mjs";
 
 function check(ok: boolean, what: string) {
   if (!ok) {
@@ -96,7 +96,7 @@ export default async function () {
         blocks[2].text === "8+1|line 8\n</chat>\n\n", "chatBlocks splits four-line blocks");
   check(chatBlocks("plain").length === 1, "chatBlocks keeps non-view text");
 
-  /* C5: a long turn keeps the previous turn's block as a fourth mark. */
+  /* A long turn keeps the previous turn's block as a fourth mark. */
   const memory: any = {};
   let p = cachePayload(turn(lines(0, 8)), undefined, memory).payload;
   check(marks(p) === 3 && marked(p)[0] === 1, "first turn: system, last whole block, end");
@@ -110,6 +110,10 @@ export default async function () {
   check(marks(p) === 3, "compactions pass no memory");
   const keyed = cachePayload(turn(lines(0, 8))).key;
   check(typeof keyed === "string" && keyed === cachePayload(turn(lines(0, 8))).key, "stable prefix key");
+  const image = { type: "image", data: "AAAA", mimeType: "image/png" };
+  const images = imageBlocks([{ type: "text", text: "t" }, { ...image, name: "extra", detail: "high" }]);
+  check(JSON.stringify(images) === JSON.stringify([image]), "image blocks keep only what the engine stores");
+  check(imageBlocks(undefined) === undefined, "no images, no field");
   surrogates();
   await restartedCalls();
   console.error("pi_js_test: ok");

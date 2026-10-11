@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createLocalBashOperations, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { Calls, Records, registerMemory, stableContext, chatBlocks, cachePayload } from "./common.mjs";
+import { Calls, Records, registerMemory, stableContext, chatBlocks, cachePayload, imageBlocks } from "./common.mjs";
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,7 +21,7 @@ function textContent(content: any): string {
 function clip(text: string): string {
   const chars = Array.from(text);
   if (chars.length <= 30000) return text;
-  const marker = "\n[... clipped ...]\n";
+  const marker = "\n[... output clipped ...]\n"; /* the engine's marker */
   const head = Math.floor((30000 - marker.length) / 2);
   const tail = 30000 - marker.length - head;
   return chars.slice(0, head).join("") + marker + chars.slice(-tail).join("");
@@ -48,9 +48,9 @@ function ownInstructions(prompt: string): string[] {
 export default function (pi: any) {
   pi.registerFlag("unii-dir", { type: "string", description: "Directory for the permanent UniiChat log" });
   pi.registerFlag("unii-bin", { type: "string", description: "Path to the UniiChat C executable" });
-  pi.registerFlag("unii-model", { type: "string", description: "Compaction model (default gpt-6-luna)" });
-  pi.registerFlag("unii-provider", { type: "string", description: "Compaction provider (default openai-codex)" });
-  pi.registerFlag("unii-effort", { type: "string", description: "Compaction reasoning effort (default xhigh)" });
+  pi.registerFlag("unii-model", { type: "string", description: "Summary model (or UNII_MODEL)" });
+  pi.registerFlag("unii-provider", { type: "string", description: "Summary provider (or UNII_PROVIDER)" });
+  pi.registerFlag("unii-effort", { type: "string", description: "Summary reasoning effort (or UNII_EFFORT)" });
   let child: any, backend: any, ctx: any, startup: Promise<void> | undefined;
   let exited: Promise<void> | undefined;
   let system = "", view = "", recent = "", directory = "";
@@ -156,18 +156,18 @@ export default function (pi: any) {
     const candidates = [resolve(here, "../unii"), resolve(here, "../../../bin/unii")];
     const binary = String(pi.getFlag("unii-bin") || process.env.UNII_BIN || candidates.find(existsSync) || "unii");
     directory = String(pi.getFlag("unii-dir") || process.env.UNII_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "uniichat"));
-    const prompt = await exec(binary, ["prompt"], { maxBuffer: 1024 * 1024, env: { ...process.env, UNII_ASSETS: here } });
+    const prompt = await exec(binary, ["prompt"], { maxBuffer: 1024 * 1024 });
     system = prompt.stdout.trimEnd();
     if (process.env.UNII_INSTRUCTIONS) system += "\n\n" + await readFile(process.env.UNII_INSTRUCTIONS, "utf8");
     const instructions = ownInstructions(ctx.getSystemPrompt());
     if (instructions.length) system += "\n\n" + instructions.join("\n\n");
+    /* The engine owns the summary defaults and reads UNII_MODEL, UNII_PROVIDER,
+     * UNII_EFFORT and UNII_TIMEOUT itself; only pi's flags are passed on. */
     const args = ["serve", directory];
-    for (const [flag, variable, fallback] of [
-      ["model", "UNII_MODEL", "gpt-6-luna"],
-      ["provider", "UNII_PROVIDER", "openai-codex"],
-      ["effort", "UNII_EFFORT", "xhigh"],
-    ]) args.push("--" + flag, String(pi.getFlag("unii-" + flag) || process.env[variable] || fallback));
-    if (process.env.UNII_TIMEOUT) args.push("--timeout", process.env.UNII_TIMEOUT);
+    for (const flag of ["model", "provider", "effort"]) {
+      const value = pi.getFlag("unii-" + flag);
+      if (value) args.push("--" + flag, String(value));
+    }
     const proc = spawn(binary, args, { stdio: ["pipe", "pipe", "inherit"] });
     /* This engine's calls answer only to it, even after a restart. */
     let calls: any;
@@ -288,7 +288,7 @@ export default function (pi: any) {
       if (running || !context.isIdle()) {
         await preparingInput;
         if (failure) return dropped(context, failure.message);
-        await request("steer", { text: event.text, images: event.images });
+        await request("steer", { text: event.text, images: imageBlocks(event.images) });
       } else {
         failure = undefined;
         summaryErrors.clear();
@@ -299,7 +299,7 @@ export default function (pi: any) {
         anchor = undefined;
         preparingInput = new Promise(resolveInput => { releaseInput = resolveInput; });
         refreshTools();
-        const turn = request("turn", { text: event.text, images: event.images });
+        const turn = request("turn", { text: event.text, images: imageBlocks(event.images) });
         /* Later input must follow the initiating record, while still reaching
          * the backend during its wait for preceding summaries. */
         releaseInput!();
@@ -367,7 +367,7 @@ export default function (pi: any) {
       await request("append", { kind: "echo", text: message.details.log });
     } else if (message.role === "toolResult") {
       await request("append", { kind: "echo", text: textContent(message.content),
-        images: message.content.filter((block: any) => block.type === "image") });
+        images: imageBlocks(message.content) });
     }
   }));
   pi.on("tool_result", (event: any) => {
@@ -382,7 +382,7 @@ export default function (pi: any) {
   }));
   pi.on("tool_execution_end", guard(async (event: any) => {
     if (event.parentToolCallId) await request("append", { kind: "echo", text: textContent(event.result?.content),
-      images: event.result?.content?.filter((block: any) => block.type === "image") });
+      images: imageBlocks(event.result?.content) });
   }));
   pi.on("agent_settled", async () => {
     running = false;
@@ -406,7 +406,7 @@ export default function (pi: any) {
           await startup;
           response = failure ? { ok: false, error: failure.message } : { ok: true, restarted: directory };
         } else if (command.startsWith("import ")) {
-          response = await request("append", { kind: "note", text: await readFile(resolve(command.slice(7).trim()), "utf8") });
+          response = await request("append", { kind: "note", text: await readFile(resolve(context.cwd, command.slice(7).trim()), "utf8") });
         } else if (command === "flush") {
           response = await request("flush").finally(idle);
         } else if (command === "retry") {

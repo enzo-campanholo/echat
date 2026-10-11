@@ -2,6 +2,7 @@
 #include "base.h"
 #include <assert.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -229,7 +230,9 @@ static void hello(Client *c)
     j = request(c, "hello", NULL, NULL);
     assert(json_ulong(json_get(j, "protocol"), &n) && n == 1);
     assert(json_ulong(json_get(j, "messages"), &n));
-    assert(!strcmp(json_str(json_get(j, "model")), "test-model"));
+    assert(!strcmp(json_str(json_get(j, "summary_provider")), "test-provider"));
+    assert(!strcmp(json_str(json_get(j, "summary_model")), "test-model"));
+    assert(!strcmp(json_str(json_get(j, "summary_effort")), "xhigh"));
     ok(j);
 }
 
@@ -244,7 +247,7 @@ static void stop(Client *c)
     free(c->error_text);
 }
 
-/* CLI readers run beside the engine, which holds the writer lock (B3/A4). */
+/* CLI readers run beside the engine, which holds the writer lock. */
 static void read_beside(const char *dir)
 {
     Buf b;
@@ -303,7 +306,7 @@ static void failed_input(const char *root, int events)
     free(dir);
 }
 
-/* History pages by id within a byte budget; images only on request (B4). */
+/* History pages by id within a byte budget; images only on request. */
 static void history(const char *root, const char *text)
 {
     Client c;
@@ -541,6 +544,34 @@ static void explicit_retry(const char *root, const char *text)
     assert(json_ulong(json_get(j, "messages"), &count) && count == 1);
     assert(json_ulong(json_get(j, "failed"), &count) && count == 0);
     ok(j);
+    stop(&c);
+    free(dir);
+}
+
+/* A failed call retries by itself 15 s later, with no message or retry
+ * request: an idle engine sleeps until that deadline (B5). */
+static void automatic_retry(const char *root, const char *text)
+{
+    Client c;
+    char *dir;
+    Json *j;
+    struct pollfd input;
+    time_t failed;
+    dir = path_join(root, "automatic-retry");
+    c = start(dir);
+    c.fail_once = 1;
+    ok(request(&c, "append", "note", text));
+    hello(&c);
+    j = request(&c, "flush", NULL, NULL);
+    assert(json_str(json_get(j, "error")) && c.errors == 1 && c.calls == 1);
+    json_free(j);
+    failed = time(NULL);
+    input.fd = fileno(c.in);
+    input.events = POLLIN;
+    assert(poll(&input, 1, 30000) == 1); /* the retry's call event */
+    assert(time(NULL) - failed >= 14);
+    ok(request(&c, "flush", NULL, NULL));
+    assert(c.calls > 1 && c.errors == 1);
     stop(&c);
     free(dir);
 }
@@ -984,6 +1015,7 @@ int main(int argc, char **argv)
     shared_socket(argv[1]);
     parent_sync(argv[1]);
     explicit_retry(argv[1], text);
+    automatic_retry(argv[1], text);
     oversized_answers(argv[1]);
     cache_gates(argv[1], text);
     sync_budget(argv[1]);
@@ -998,6 +1030,6 @@ int main(int argc, char **argv)
     assert(after && !strcmp(before, after));
     free(before); free(after); free(path); free(big);
     stop(&c);
-    puts("server: host calls, corrections, ceiling, timeouts, gates, steering, restart OK");
+    puts("server: host calls, corrections, ceiling, timeouts, automatic retries, gates, steering, restart OK");
     return 0;
 }

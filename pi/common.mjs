@@ -37,6 +37,14 @@ export function registerMemory(pi, memory) {
   });
 }
 
+/* The engine stores image blocks exactly as {type, data, mimeType}; a tool's
+ * extra fields would make it refuse the whole record. */
+export function imageBlocks(content) {
+  if (!Array.isArray(content)) return undefined;
+  return content.filter(block => block?.type === "image")
+    .map(({ type, data, mimeType }) => ({ type, data, mimeType }));
+}
+
 /* Split only LF, never Unicode paragraph separators. Keep byte prefixes stable. */
 export function chatBlocks(text) {
   if (!text.startsWith("<chat>\n")) return [{ type: "text", text }];

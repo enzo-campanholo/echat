@@ -20,7 +20,13 @@ src/base.o: src/base.c src/base.h
 src/store.o: src/store.c src/store.h src/base.h
 src/view.o: src/view.c src/store.h src/base.h
 src/engine.o: src/engine.c src/engine.h src/store.h src/base.h
-src/main.o: src/main.c src/engine.h src/store.h src/base.h
+src/main.o: src/main.c src/prompt.h src/engine.h src/store.h src/base.h
+
+# The prompt is built in, one C string per line: C89 guarantees literals of
+# only 509 bytes. Escape \, " and ? (a ?? pair could start a trigraph).
+src/prompt.h: pi/prompt.txt
+	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/?/\\?/g' -e 's/^/"/' \
+	    -e 's/$$/\\n",/' pi/prompt.txt > $@
 
 .c.o:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
@@ -42,7 +48,7 @@ tests/server_test: tests/server_test.c src/base.o
 
 # Every sync goes through the injected fsync. UNII_PLAIN_FSYNC skips
 # F_FULLFSYNC, which succeeds first on macOS and would bypass the injection.
-tests/fsync_test: tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/main.c src/base.h src/store.h src/engine.h
+tests/fsync_test: tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/main.c src/prompt.h src/base.h src/store.h src/engine.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -Dfsync=unii_test_fsync -DUNII_PLAIN_FSYNC -Isrc -o $@ tests/fsync_fault.c src/base.c src/store.c src/view.c src/engine.c src/main.c
 
 test: all $(TESTS)
@@ -78,7 +84,7 @@ test-pi: all $(PI_TESTS)
 install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/unii/pi
 	cp unii $(DESTDIR)$(PREFIX)/bin/unii
-	cp pi/*.mjs pi/*.ts pi/prompt.txt $(DESTDIR)$(PREFIX)/share/unii/pi/
+	cp pi/*.mjs pi/*.ts $(DESTDIR)$(PREFIX)/share/unii/pi/
 
 clean:
-	rm -f unii src/*.o $(TESTS) $(PI_TESTS)
+	rm -f unii src/*.o src/prompt.h $(TESTS) $(PI_TESTS)

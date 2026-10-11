@@ -514,7 +514,7 @@ static void torn_tails(void)
 }
 
 /* A crash can leave a temp file of an atomic save; the next writer removes
- * it, a reader never does (D10). */
+ * it, a reader never does. */
 static void stray_temps(void)
 {
     Store s;

@@ -77,10 +77,10 @@ static void send_record(FILE *out, const char *type, const char *message, int im
         buf_json(&b, message);
     } else
         buf_puts(&b, ",\"enabled\":false");
-    if (image) {
+    if (image) { /* a client's extra field never reaches the engine */
         buf_puts(&b, ",\"images\":[{\"type\":\"image\",\"data\":");
         buf_json(&b, image_data);
-        buf_puts(&b, ",\"mimeType\":\"image/png\"}]");
+        buf_puts(&b, ",\"mimeType\":\"image/png\",\"name\":\"pixel.png\"}]");
     }
     buf_puts(&b, "}\n");
     assert(fwrite(b.s, 1, b.len, out) == b.len && fflush(out) == 0);

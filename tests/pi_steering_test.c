@@ -108,7 +108,7 @@ static Json *receive(FILE *in)
         fprintf(stderr, "Pi steering failed: %s\n", b.s);
         assert(0);
     }
-    /* Memory progress reaches RPC clients as setStatus records (B4). */
+    /* Memory progress reaches RPC clients as setStatus records. */
     method = json_str(json_get(j, "method"));
     status = json_str(json_get(j, "statusText"));
     if (type && !strcmp(type, "extension_ui_request") && method &&

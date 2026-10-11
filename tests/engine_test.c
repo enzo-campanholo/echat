@@ -286,10 +286,14 @@ static void predecessor_window_and_retry(void)
     context = engine_context(&e, jobs[14]);
     assert(context && !strcmp(context, "<chat>\n</chat>\n"));
     free(context);
-    /* Synchronizing without a new message must not retry failed work. */
+    /* Synchronizing without a new message must not retry failed work, nor
+     * must a record the agent wrote: only the user's words do. */
     assert(engine_sync(&e) == 0);
     assert(engine_next(&e, &j) == 0);
-    assert(!add(&s, "note", "immediate new message"));
+    assert(!add(&s, "echo", "agent output"));
+    assert(engine_sync(&e) == 0);
+    assert(engine_next(&e, &j) == 0 && e.failed.n - e.failed.head == 1);
+    assert(!add(&s, "user", "immediate new message"));
     assert(engine_sync(&e) == 0);
     assert(engine_next(&e, &retry) == 1);
     check_job(retry, 0, 0);
@@ -309,10 +313,10 @@ static void predecessor_window_and_retry(void)
         if (rc == 1)
             assert(engine_done(&e, j, "merged") == 0);
     } while (rc == 1);
-    assert(e.contiguous == 17 && e.inflight == 0);
-    assert(engine_caught_up(&e, 17));
-    assert(node_is(&s, ref(0, 16),
-                   "note: immediate new message", ""));
+    assert(e.contiguous == 18 && e.inflight == 0);
+    assert(engine_caught_up(&e, 18));
+    assert(node_is(&s, ref(0, 16), "echo: agent output", ""));
+    assert(node_is(&s, ref(0, 17), "user: immediate new message", ""));
     engine_close(&e);
     store_close(&s);
     free(long_text);
@@ -609,8 +613,8 @@ static void oversized_summaries(void)
     free(dir);
 }
 
-/* Failed nodes retry after 15, 60 and 300 s, then wait for a message or an
- * explicit retry, which restarts the schedule (B5). */
+/* Failed nodes retry after 15, 60 and 300 s, then wait for the user's next
+ * message or an explicit retry, which restarts the schedule (B5). */
 static void automatic_retries(void)
 {
     Store s;

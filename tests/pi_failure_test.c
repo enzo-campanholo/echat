@@ -43,7 +43,7 @@ static void set_path(const char *name, const char *dir, const char *file)
     free(path);
 }
 
-/* With UNII_TEST_FAIL_APPEND_ONCE, only the first backend fails (B6). */
+/* With UNII_TEST_FAIL_APPEND_ONCE, only the first backend fails (/unii restart). */
 static int once(void)
 {
     const char *marker;

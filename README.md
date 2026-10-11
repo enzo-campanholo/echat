@@ -42,11 +42,12 @@ pi --no-session -e ./pi/unii.ts \
   --unii-provider openai-codex --unii-model gpt-6-luna --unii-effort xhigh
 ```
 
-(`UNII_PROVIDER`, `UNII_MODEL`, `UNII_EFFORT` and `UNII_TIMEOUT` do the same
-from the environment.) The default chat directory is `$XDG_STATE_HOME/uniichat`,
-or `~/.local/state/uniichat`. It is shared across projects, so the chat follows
-you. Use `--unii-dir` for a separate chat. One running pi process owns each
-chat; a second writer is refused. Readers never need the lock (see below).
+(`UNII_PROVIDER`, `UNII_MODEL`, `UNII_EFFORT` and `UNII_TIMEOUT` set the same
+from the environment, for pi and `unii serve` alike; flags win.) The default
+chat directory is `$XDG_STATE_HOME/uniichat`, or `~/.local/state/uniichat`. It
+is shared across projects, so the chat follows you. Use `--unii-dir` for a
+separate chat. One running pi process owns each chat; a second writer is
+refused. Readers never need the lock (see below).
 
 To register the built repository as a local pi package:
 
@@ -75,8 +76,10 @@ Included shell commands stop when memory cannot be saved.
 
 ## Instructions and commands
 
-The shared prompt is [pi/prompt.txt](pi/prompt.txt) (the spec's prompt;
-`unii prompt` prints it, with the one sentence that spec change C2 rewords).
+The shared prompt is [pi/prompt.txt](pi/prompt.txt) (the spec's prompt). It is
+built into the binary, so it always matches the engine: run `make` after
+editing it. `unii prompt` prints it, with the one sentence that spec change C2
+rewords.
 Pi's project instructions and custom prompt sections are captured at startup
 and appended to it. Date and working directory are sent after the view.
 `UNII_INSTRUCTIONS` can name a UTF-8 file with additional personal
@@ -120,7 +123,7 @@ Imports build short nodes without a model. Long imports are summarized when
 the extension starts. A fresh turn waits for the summaries of earlier messages
 only if those messages do not fit whole in `<recent>` (spec change C2), and
 for enough built parents to keep its view within 128,000 bytes. A failed
-summary is retried 15, 60 and 300 seconds later, at the next message, or on
+summary is retried 15, 60 and 300 seconds later, at your next message, or on
 `/unii retry`; a turn that cannot get complete memory reports it, with its
 words already saved. Backend and persistence failures stop the turn and block
 subsequent tools. Background summary failures appear as pi notifications,
@@ -187,13 +190,13 @@ code point to 512 bytes, so no node can crowd the 32,000-byte contexts out.
 Built nodes are immutable.
 
 Up to eight model calls run concurrently, each with a timeout (300 seconds by
-default; `unii serve --timeout`, monotonic clock). Missing message nodes and
-ready parents enter queues; startup makes one linear pass and subsequent work
-never rescans the tree. A message starts with fewer than eight unbuilt
-predecessors. Context stops before the first missing node and never exposes
-part of a message. Jobs whose complete context would exceed 32,000 bytes wait
-for earlier parent merges, in a heap by their context cutoff, and become
-eligible as the saved compaction view shrinks.
+default; `unii serve --timeout` or `UNII_TIMEOUT`, monotonic clock). Missing
+message nodes and ready parents enter queues; startup makes one linear pass
+and subsequent work never rescans the tree. A message starts with fewer than
+eight unbuilt predecessors. Context stops before the first missing node and
+never exposes part of a message. Jobs whose complete context would exceed
+32,000 bytes wait for earlier parent merges, in a heap by their context
+cutoff, and become eligible as the saved compaction view shrinks.
 
 The turn view grows past 128,000 bytes, then merges toward 64,000. Only built
 parents are eligible. Pair priority uses age from the pair's **last** message,
@@ -249,7 +252,10 @@ Deliberate changes, each easy to find in the code:
   unterminated final line was never acknowledged; the writer moves its bytes
   to `FILE.torn` and truncates it from the log instead of refusing to open.
 - **Retries (B5).** The spec retries a failed call at the next message. Here
-  it is also retried after 15, 60 and 300 seconds and on `/unii retry`.
+  it is also retried after 15, 60 and 300 seconds and on `/unii retry`, and
+  only the user's messages (typed input, steering, `!commands`) retry it: one
+  turn logs hundreds of replies, tool calls and results, and retrying on each
+  would hammer a provider that is failing or rate-limiting.
 - **Size ceiling (A1).** "A few bytes over is fine" is bounded: a shortest
   answer more than 64 bytes over is cut at a code point to 512 bytes.
 - **View saves (D9).** Appending a message no longer rewrites `view.json`;
