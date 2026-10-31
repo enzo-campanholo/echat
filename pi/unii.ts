@@ -1,4 +1,3 @@
-/* The Pi adapter is the JavaScript boundary; UniiChat's engine is POSIX C89. */
 import { spawn, execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -9,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createLocalBashOperations, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Calls, Records, registerMemory, stableContext, chatBlocks, cachePayload, imageBlocks } from "./common.mjs";
+import { summaryOutcome } from "./summary.mjs";
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,20 +21,19 @@ function textContent(content: any): string {
 function clip(text: string): string {
   const chars = Array.from(text);
   if (chars.length <= 30000) return text;
-  const marker = "\n[... output clipped ...]\n"; /* the engine's marker */
+  const marker = "\n[... output clipped ...]\n";
   const head = Math.floor((30000 - marker.length) / 2);
   const tail = 30000 - marker.length - head;
   return chars.slice(0, head).join("") + marker + chars.slice(-tail).join("");
 }
 
-/* Match Pi's native bash normalization, including ANSI split across chunks. */
+/* Match pi's shell output, including ANSI sequences split across chunks. */
 const ansiEnd = "(?:\\u0007|\\u001B\\u005C|\\u009C)";
 const ansiOsc = "\\u001B\\]";
 const ansiCsi = "[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?";
 const ansiCodes = new RegExp(`(?:${ansiOsc}[\\s\\S]*?${ansiEnd})|${ansiCsi}[\\dA-PR-TZcf-nq-uy=><~]`, "g");
 const ansiPending = new RegExp(`(?:${ansiOsc}(?:[^\\u0007\\u009C\\u001B]|\\u001B(?!\\\\))*|${ansiCsi})$`);
 
-/* Pi's structured prompt keeps user instructions separate from device state. */
 function ownInstructions(prompt: string): string[] {
   const sections = [...prompt.matchAll(/<([A-Za-z_][A-Za-z0-9_]*)>\n([\s\S]*?)\n<\/\1>/g)];
   const head = prompt.slice(0, sections[0]?.index ?? prompt.length).trim();
@@ -56,13 +55,13 @@ export default function (pi: any) {
   let system = "", view = "", recent = "", directory = "";
   let fresh = false, cut = -1, running = false, lastPrefix: string | undefined;
   let turnState = "", anchor: number | undefined;
-  const turnMark: any = {}; /* the previous turn's last whole view block */
+  const turnMark: any = {};
   let preparingInput: Promise<void> | undefined;
   let tools: any[] = [], providerTools: any[] | undefined;
   let shuttingDown = false;
   let failure: Error | undefined;
   const summaryErrors = new Set<string>();
-  let summaries: any; /* the running engine's summary calls */
+  let summaries: any;
   const summarySession = "uniichat-" + randomUUID();
 
   const stop = (error: any, context = ctx) => {
@@ -71,8 +70,7 @@ export default function (pi: any) {
     if (context?.hasUI) context.ui.notify("UniiChat stopped: " + failure.message, "error");
     else console.error("UniiChat stopped: " + failure.message);
   };
-  /* Pi reports thrown event handlers and continues. Abort explicitly whenever
-   * the memory boundary fails, including before executing a tool batch. */
+  /* Pi reports handler exceptions but continues; memory failures must abort. */
   const guard = (handler: any) => async (event: any, context: any) => {
     ctx = context;
     if (failure) { context.abort(); return; }
@@ -84,7 +82,6 @@ export default function (pi: any) {
     if (!backend) return Promise.reject(new Error("UniiChat backend is not running"));
     return backend.request({ op, ...data });
   };
-  /* Turns and summaries share the active tools (never called by summaries). */
   const refreshTools = (nextProviderTools?: any[]) => {
     if (nextProviderTools) providerTools = nextProviderTools;
     const active = pi.getActiveTools();
@@ -103,10 +100,6 @@ export default function (pi: any) {
     if (ctx?.hasUI) ctx.ui.notify(message + "\n" + help, "error");
     else console.error(message + "\n" + help);
   };
-  /* The engine decides what to ask, when, and how to correct it; this only
-   * performs one plain completion (no tool execution). Calls (common.mjs)
-   * binds it, its cache gating (SEND) and its result to the engine that
-   * asked. */
   const summarize = async (event: any, signal: AbortSignal, send: (data: any) => Promise<any>) => {
     let key: string | undefined;
     const model = ctx.modelRegistry.find(event.provider, event.model);
@@ -114,14 +107,16 @@ export default function (pi: any) {
     if (!ctx.modelRegistry.hasConfiguredAuth(model)) throw new Error("no credentials for " + event.provider);
     const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-    /* The view goes in four-line blocks, so cache marks land as in turns. */
     const messages = event.messages.map((m: any) => m.role === "user"
       ? { role: "user", content: [...chatBlocks(m.text), ...(m.images || [])], timestamp: Date.now() }
       : { role: "assistant", content: [{ type: "text", text: m.text }], api: model.api, provider: model.provider,
           model: model.id, usage, stopReason: "stop", timestamp: Date.now() });
-    const reply = await ctx.modelRegistry.streamSimple(model, { systemPrompt: system, messages, tools }, {
+    const outcome = summaryOutcome();
+    const stream = ctx.modelRegistry.streamSimple(model, { systemPrompt: system, messages, tools }, {
       reasoning: event.effort, signal, sessionId: summarySession,
+      onProviderStreamEvent: outcome.observe,
       onPayload: async (payload: any) => {
+        outcome.reset();
         const marked = cachePayload(payload, providerTools);
         key = marked.key;
         if (key) await send({ op: "cache_wait", key, call: event.call });
@@ -132,23 +127,18 @@ export default function (pi: any) {
         if (key && !(response?.status >= 400)) await send({ op: "cache_started", key, call: event.call });
         key = undefined;
       },
-    }).result();
+    });
+    let terminal: string | undefined;
+    for await (const update of stream) {
+      if (update.type === "done" || update.type === "error") terminal = update.type;
+    }
+    const reply = await stream.result();
     if (signal.aborted) throw new Error("summary request aborted");
-    if (reply.stopReason === "error" || reply.stopReason === "aborted")
-      throw new Error(reply.errorMessage || "summary request " + reply.stopReason);
-    if (reply.content.some((block: any) => block.type === "toolCall"))
-      throw new Error("compaction attempted to call a tool");
-    /* Never infer refusal from exception/error text. Only an explicit provider
-     * refusal or an answered-empty completion permits clipped-source fallback. */
-    if (reply.stopReason === "refusal") return { outcome: "refused" };
-    if (reply.stopReason !== "stop" && reply.stopReason !== "length")
-      throw new Error("unexpected summary stop reason: " + reply.stopReason);
-    if (reply.content.some((block: any) => block.type === "refusal")) return { outcome: "refused" };
-    const text = reply.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n");
-    return text.trim() ? { outcome: "ok", text } : { outcome: "empty" };
+    return outcome.result(reply, terminal);
   };
-  /* Memory progress replaces the status line while a turn or flush waits. */
-  const idle = () => { if (ctx?.hasUI && directory) ctx.ui.setStatus("unii", "UniiChat · " + directory); };
+  const idle = () => {
+    if (ctx?.hasUI && directory) ctx.ui.setStatus("unii", "UniiChat · " + directory);
+  };
   const waiting = (count: number) => {
     if (!ctx?.hasUI) return;
     ctx.ui.setStatus("unii", count ? "UniiChat · summarizing " + count + " earlier message" + (count === 1 ? "" : "s")
@@ -169,15 +159,13 @@ export default function (pi: any) {
     if (process.env.UNII_INSTRUCTIONS) system += "\n\n" + await readFile(process.env.UNII_INSTRUCTIONS, "utf8");
     const instructions = ownInstructions(ctx.getSystemPrompt());
     if (instructions.length) system += "\n\n" + instructions.join("\n\n");
-    /* The engine owns the summary defaults and reads UNII_MODEL, UNII_PROVIDER,
-     * UNII_EFFORT and UNII_TIMEOUT itself; only pi's flags are passed on. */
+    /* Let the engine resolve environment settings and defaults. */
     const args = ["serve", directory];
     for (const flag of ["model", "provider", "effort"]) {
       const value = pi.getFlag("unii-" + flag);
       if (value) args.push("--" + flag, String(value));
     }
     const proc = spawn(binary, args, { stdio: ["pipe", "pipe", "inherit"] });
-    /* This engine's calls answer only to it, even after a restart. */
     let calls: any;
     const records = new Records(proc.stdout, proc.stdin, (event: any) => onEvent(calls, event), (error: Error) => {
       calls.close();
@@ -238,7 +226,6 @@ export default function (pi: any) {
       if (!backend || backend.closed) throw new Error("UniiChat backend is not running");
       if (!running && context.isIdle()) { failure = undefined; summaryErrors.clear(); }
       if (failure) throw failure;
-      /* Logged as typed, so summaries read a command, not chat words. */
       await request("append", { kind: "user", text: "!" + event.command });
     } catch (error) {
       stop(error, context);
@@ -277,9 +264,8 @@ export default function (pi: any) {
     } };
   });
 
-  registerMemory(pi, async (name: string, args: any) => await request(name, { args }));
+  registerMemory(pi, (name: string, args: any) => request(name, { args }));
   pi.on("tool_call", () => failure ? { block: true, reason: failure.message, terminate: true } : undefined);
-  /* Never drop input silently: over RPC this is a visible notify record. */
   const dropped = (context: any, why: string) => {
     const text = "UniiChat did not save this message: " + why + ". Use /unii restart, then resend.";
     if (context?.hasUI) context.ui.notify(text, "error");
@@ -308,8 +294,7 @@ export default function (pi: any) {
         preparingInput = new Promise(resolveInput => { releaseInput = resolveInput; });
         refreshTools();
         const turn = request("turn", { text: event.text, images: imageBlocks(event.images) });
-        /* Later input must follow the initiating record, while still reaching
-         * the backend during its wait for preceding summaries. */
+        /* Let steering follow this append without waiting for summaries. */
         releaseInput!();
         preparingInput = undefined;
         const response = await turn.finally(idle);
@@ -328,8 +313,7 @@ export default function (pi: any) {
   });
   pi.on("message_start", guard((event: any, context: any) => {
     if (fresh && event.message.role === "user") {
-      /* Pi emits the initiating user before draining queued steering. Capture
-       * its position in the UI transcript before message_end persists it. */
+      /* message_end persists this input before pi drains queued steering. */
       cut = context.sessionManager.buildSessionContext().messages
         .filter((message: any) => message.role !== "system").length;
       anchor = event.message.timestamp;
@@ -344,7 +328,6 @@ export default function (pi: any) {
     const current = conversation.slice(cut);
     const first = current[0];
     const content = typeof first.content === "string" ? [{ type: "text", text: first.content }] : first.content;
-    /* Unsummarized messages, whole, follow the view and precede the state. */
     const tail = recent ? [{ type: "text", text: recent + "\n" }] : [];
     current[0] = { ...first, content: [...chatBlocks(view + "\n\n"), ...tail, { type: "text", text: turnState }, ...content] };
     return { messages: stableContext(current, system, tools) };
@@ -363,7 +346,6 @@ export default function (pi: any) {
   pi.on("message_end", guard(async (event: any) => {
     const message = event.message;
     if (message.role === "assistant") {
-      /* One write for the message's replies and tool calls, in order. */
       const records = message.content.flatMap((block: any) =>
         block.type === "text" && block.text ? [{ kind: "unii", text: block.text }]
         : block.type === "toolCall" ? [{ kind: "tool", text: block.name + " " + JSON.stringify(block.arguments) }]
@@ -371,7 +353,6 @@ export default function (pi: any) {
       if (records.length) await request("append", { records });
     } else if (message.role === "toolResult" && message.toolName === "zoom" &&
                !message.isError && message.details?.log) {
-      /* The tree already holds what zoom shows: log a reference, not a copy. */
       await request("append", { kind: "echo", text: message.details.log });
     } else if (message.role === "toolResult") {
       await request("append", { kind: "echo", text: textContent(message.content),
@@ -379,9 +360,8 @@ export default function (pi: any) {
     }
   }));
   pi.on("tool_result", (event: any) => {
-    /* Successful engine retrievals are already bounded/paginated. The page
-     * header is outside the body budget; clipping it again loses original
-     * bytes without offering another page. Keep C4's short-reference log. */
+    /* A zoom page's header is outside its body budget. Clipping the combined
+     * text would lose bytes that no later page can retrieve. */
     if (event.toolName === "zoom" && !event.isError && event.details?.log) return;
     const text = textContent(event.content);
     const clipped = clip(text);
@@ -414,7 +394,6 @@ export default function (pi: any) {
       let response;
       try {
         if (command === "restart") {
-          /* Relaunch the engine without restarting pi; the log is untouched. */
           await shutdown();
           reset();
           startup = launch().catch(stop);
@@ -431,8 +410,6 @@ export default function (pi: any) {
           response = await request("status");
         }
       } catch (error: any) {
-        /* A refused command (a flush superseded by a turn, a missing file)
-         * is a notice, not a thrown handler. A stopped engine reports itself. */
         const text = "UniiChat: " + (error?.message || String(error));
         if (context.hasUI) context.ui.notify(text, "error");
         else console.error(text);

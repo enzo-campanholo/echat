@@ -129,7 +129,6 @@ const char *store_kind(Store *s, unsigned long i)
     return kinds[s->messages[i].kind];
 }
 
-/* Daily log paths are interned, so an index entry names its file in 4 bytes. */
 unsigned int store_file(Store *s, const char *path)
 {
     unsigned int k;
@@ -189,7 +188,6 @@ static int day_valid(const char *p)
     return day >= 1 && day <= limit;
 }
 
-/* A record's day may precede its file's day (see today()), never follow it. */
 static int date_valid(const char *p, const char *filename)
 {
     size_t n;
@@ -280,8 +278,7 @@ static int message_fields(const Json *j)
                     object_fields(j, 5);
 }
 
-/* Decoded JSON strings are valid UTF-8 without NUL, so text needs no
- * second scan. FILENAME is the record's daily file name. */
+/* json_parse already checked UTF-8 and rejected NUL. */
 static int record_valid(const Json *j, unsigned long id, const char *filename)
 {
     unsigned long stored, size;
@@ -293,9 +290,7 @@ static int record_valid(const Json *j, unsigned long id, const char *filename)
            date_valid(json_str(json_get(j, "date")), filename);
 }
 
-/* SHA-256 of the entire original JSONL record, excluding LF. This is a
- * live-index change detector, not persisted trust metadata or authentication.
- * unsigned long is at least 32 bits; mask every word for wider C89 hosts. */
+/* SHA-256 words must stay 32 bits even when unsigned long is wider. */
 static unsigned long rotate32(unsigned long x, unsigned int n)
 {
     return ((x >> n) | (x << (32 - n))) & 0xffffffffUL;
@@ -349,6 +344,7 @@ static void fingerprint_block(unsigned long h[8], const unsigned char *block)
     h[6] = (h[6] + g) & 0xffffffffUL; h[7] = (h[7] + v) & 0xffffffffUL;
 }
 
+/* Hash the original JSON bytes, excluding LF, for live-index change detection. */
 static void fingerprint(unsigned char out[32], const char *record, size_t length)
 {
     unsigned long h[8];
@@ -425,7 +421,7 @@ static int add_message(Store *s, unsigned int file, off_t offset, const Json *j,
 }
 
 static int add_node(Store *s, unsigned int file, off_t offset, const Json *j,
-                    const char *record, size_t length)
+                     const char *record, size_t length)
 {
     unsigned long l, i, size;
     Ref r, a, b;
@@ -465,7 +461,6 @@ static int name_cmp(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* Daily log names in DIR, sorted: file order is append order. */
 static int list_logs(Store *s, const char *dir, char ***names, size_t *count)
 {
     DIR *d;
@@ -495,7 +490,8 @@ static int list_logs(Store *s, const char *dir, char ***names, size_t *count)
     }
     if (!entry && errno)
         result = io_fail(s, "cannot read log directory", dir);
-    closedir(d);
+    if (closedir(d) < 0 && !result)
+        result = io_fail(s, "cannot close log directory", dir);
     if (!result && *count > 1)
         qsort(*names, *count, sizeof(**names), name_cmp);
     return result;
@@ -509,7 +505,6 @@ static void free_names(char **names, size_t count)
     free(names);
 }
 
-/* Streams a log's lines in large blocks. */
 typedef struct Reader {
     int fd;
     off_t offset; /* file offset of block[0] */
@@ -517,8 +512,8 @@ typedef struct Reader {
     char block[65536];
 } Reader;
 
-/* 1: a complete line (its LF dropped) starting at *at; 2: a final segment
- * without LF; 0: end of file; -1: read error. */
+/* 1: line without LF; 2: unterminated tail; 0: EOF; -1: read error.
+ * *at is the starting file offset. */
 static int reader_line(Reader *r, Buf *line, off_t *at)
 {
     char *lf;
@@ -551,26 +546,8 @@ static int reader_line(Reader *r, Buf *line, off_t *at)
     }
 }
 
-static int sync_path(const char *path)
-{
-    int fd, result, err;
-    fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return -1;
-    result = sync_fd(fd);
-    err = errno;
-    if (close(fd) < 0 && !result) {
-        result = -1;
-        err = errno;
-    }
-    errno = err;
-    return result;
-}
-
-/* A final record without its LF never finished its write, so its fsync never
- * returned and it was never acknowledged. The writer keeps its bytes in
- * PATH.torn (outside the *.jsonl pattern) and cuts the log back to its last
- * complete line; to a reader it is a write in progress. */
+/* An unterminated record was not acknowledged. Save its bytes outside the
+ * *.jsonl pattern before truncating; readers leave an in-progress write alone. */
 static int torn_tail(Store *s, const char *path, off_t offset, const Buf *tail)
 {
     Buf torn;
@@ -624,8 +601,7 @@ static int load_logs(Store *s, const char *subdir, int tree)
     int result, rc, done;
     dir = path_join(s->dir, subdir);
     result = list_logs(s, dir, &names, &count);
-    /* Appends go to the newest name, even an empty file's, so names stay
-     * monotone in append order. */
+    /* Include empty files so the next append cannot move to an older name. */
     if (!result && count)
         memcpy(tree ? s->tree_day : s->main_day, names[count - 1], 17);
     r = xmalloc(sizeof(*r));
@@ -656,8 +632,7 @@ static int load_logs(Store *s, const char *subdir, int tree)
             } else if (!(j = json_parse(line.s))) {
                 result = store_fail(s, "invalid JSON log record; preserve log and recover a backup", path);
             } else if (tree && s->lockfd < 0 && beyond(s, j)) {
-                /* A reader read main/ first: a node over later messages was
-                 * built after that snapshot, and so was everything after it. */
+                /* Later tree records may depend on messages beyond this snapshot. */
                 json_free(j);
                 done = 1;
                 break;
@@ -688,7 +663,7 @@ static int same_view(const View *a, const View *b)
     return 1;
 }
 
-int store_save_file(Store *s, const char *name, const Buf *b)
+static int save_file(Store *s, const char *name, const Buf *b, int sync_dir)
 {
     char *path, *tmp;
     int fd, result, err;
@@ -711,7 +686,7 @@ int store_save_file(Store *s, const char *name, const Buf *b)
         result = -1;
         err = errno;
     }
-    if (!result && sync_parent(path) < 0) {
+    if (!result && sync_dir && sync_parent(path) < 0) {
         result = -1;
         err = errno;
     }
@@ -725,9 +700,14 @@ int store_save_file(Store *s, const char *name, const Buf *b)
     return result;
 }
 
-/* .state journals view.json's batch flag: if a crash lands between the two
- * saves, the view on disk tells which flag goes with it. */
-static int state_write(Store *s, int previous)
+int store_save_file(Store *s, const char *name, const Buf *b)
+{
+    return save_file(s, name, b, 1);
+}
+
+/* Save both batch flags before replacing view.json. Recovery selects the
+ * flag whose view matches the file that survived. */
+static int state_write(Store *s, int previous, int sync_dir)
 {
     Buf b;
     int result;
@@ -741,7 +721,7 @@ static int state_write(Store *s, int previous)
     buf_puts(&b, ",\"view\":");
     view_dump(&b, &s->view);
     buf_puts(&b, "}\n");
-    result = store_save_file(s, ".state", &b);
+    result = save_file(s, ".state", &b, sync_dir);
     if (!result)
         s->journaled = s->view.shrinking != 0;
     buf_free(&b);
@@ -783,20 +763,25 @@ static int state_read(Store *s)
     return result;
 }
 
-int store_save_view(Store *s)
+static int save_view(Store *s, int sync_dir)
 {
     Buf b;
     int result;
     if (s->lockfd < 0)
         return store_fail(s, "chat is open read-only", NULL);
-    if (state_write(s, s->journaled) < 0)
+    if (state_write(s, s->journaled, sync_dir) < 0)
         return -1;
     buf_init(&b);
     view_dump(&b, &s->view);
     buf_putc(&b, '\n');
-    result = store_save_file(s, "view.json", &b);
+    result = save_file(s, "view.json", &b, sync_dir);
     buf_free(&b);
     return result;
+}
+
+int store_save_view(Store *s)
+{
+    return save_view(s, 1);
 }
 
 static int acquire_lock(Store *s)
@@ -841,10 +826,9 @@ static int acquire_lock(Store *s)
     return 0;
 }
 
-/* The log directories exist and their entries are durable, including any a
- * crashed writer created without syncing, and so is the chat directory's own
- * entry in its parent. Its stray temp files go. */
-static int prepare_dir(Store *s)
+/* Collect all setup barriers together; the final chat sync also persists the
+ * lock, log-directory names and initial metadata saves. */
+static int prepare_dir(Store *s, DirSync **pending)
 {
     static const char *const subdirs[] = { "main", "tree" };
     DIR *d;
@@ -853,17 +837,13 @@ static int prepare_dir(Store *s)
     size_t k;
     for (k = 0; k < 2; k++) {
         path = path_join(s->dir, subdirs[k]);
-        if (mkdirs(path) < 0 || sync_path(path) < 0) {
+        if (mkdirs_pending(path, pending) < 0) {
             io_fail(s, "cannot prepare log directory", path);
             free(path);
             return -1;
         }
         free(path);
     }
-    if (sync_path(s->dir) < 0)
-        return io_fail(s, "cannot sync chat directory", s->dir);
-    if (sync_parent(s->dir) < 0)
-        return io_fail(s, "cannot sync the chat directory's parent", s->dir);
     d = opendir(s->dir);
     if (!d)
         return io_fail(s, "cannot list chat directory", s->dir);
@@ -874,26 +854,23 @@ static int prepare_dir(Store *s)
         unlink(path);
         free(path);
     }
-    closedir(d);
+    if (closedir(d) < 0)
+        return io_fail(s, "cannot close chat directory", s->dir);
     return 0;
 }
 
-/* Messages logged after the saved view join it as leaves, verbatim. */
-static int add_tail(Store *s)
+static void add_tail(Store *s)
 {
     unsigned long end;
     Ref r;
-    int tail;
     end = s->view.n ? ref_start(s->view.v[s->view.n - 1]) +
                      ref_span(s->view.v[s->view.n - 1]) : 0;
-    tail = end < s->count;
     for (; end < s->count; end++) {
         r.l = 0;
         r.i = end;
         view_add(&s->view, r);
     }
     view_measure(s, &s->view);
-    return tail;
 }
 
 static int load_view(Store *s, const char *text)
@@ -909,15 +886,20 @@ static int load_view(Store *s, const char *text)
 int store_open(Store *s, const char *dir)
 {
     char *path, *text;
+    DirSync *pending;
     int result;
     memset(s, 0, sizeof(*s));
     s->lockfd = -1;
     s->dir = xstrdup(dir);
-    if (mkdirs(dir) < 0)
-        return io_fail(s, "cannot create chat directory", dir);
-    if (acquire_lock(s) < 0 || prepare_dir(s) < 0 ||
+    pending = NULL;
+    result = -1;
+    if (mkdirs_pending(dir, &pending) < 0) {
+        io_fail(s, "cannot create chat directory", dir);
+        goto done;
+    }
+    if (acquire_lock(s) < 0 || prepare_dir(s, &pending) < 0 ||
         load_logs(s, "main", 0) < 0 || load_logs(s, "tree", 1) < 0)
-        return -1;
+        goto done;
     path = path_join(dir, "view.json");
     errno = 0;
     text = read_file(path);
@@ -927,35 +909,41 @@ int store_open(Store *s, const char *dir)
         else if (s->count)
             result = store_fail(s, "saved view is missing; restore it from backup (replay destroys the prompt cache)", path);
         else
-            result = store_save_view(s);
+            /* No prior view or messages: either surviving empty view/journal
+             * is recoverable. One final directory barrier can cover both.
+             * Normal view replacement still persists the journal first. */
+            result = save_view(s, 0);
         free(path);
-        return result;
+        goto done;
     }
     free(path);
     result = load_view(s, text);
     free(text);
     if (result < 0)
-        return -1;
+        goto done;
+    result = -1;
     view_measure(s, &s->view);
     s->view.shrinking = s->view.bytes > VIEW_HIGH;
     if (state_read(s) < 0)
-        return -1;
+        goto done;
     if (s->view.bytes > VIEW_HIGH)
         s->view.shrinking = 1;
-    /* Normalize the recovered prior state before another save can journal it. */
-    if (state_write(s, s->view.shrinking) < 0)
-        return -1;
-    /* The saved view stays as it is: appended leaves are always recovered
-     * from the log, so the live view equals the one before the restart. */
+    /* Normalize the recovered prior state before another save can journal it.
+     * No view replacement follows here, so setup's barrier covers this rename. */
+    if (state_write(s, s->view.shrinking, 0) < 0)
+        goto done;
+    /* Do not rebuild merges: that would change the cached prompt prefix. */
     add_tail(s);
     if (s->view.bytes > VIEW_HIGH)
         s->view.shrinking = 1;
-    return 0;
+    result = 0;
+done:
+    if (finish_dirs(&pending, !result) < 0 && !result)
+        result = io_fail(s, "cannot sync chat directory setup", dir);
+    return result;
 }
 
-/* Readers never create, lock or write, so they work while a writer runs.
- * Writers append whole lines and rename views atomically: reading view.json
- * first, then main/, then tree/, finds everything the view names. */
+/* Read view.json before the logs so every node it names is in the snapshot. */
 int store_open_read(Store *s, const char *dir)
 {
     char *path, *text;
@@ -1022,9 +1010,7 @@ void store_close(Store *s)
     s->lockfd = -1;
 }
 
-/* The record keeps the real clock. Its file is max(newest file, today), so a
- * clock step backward (or one bad reading forward) never reorders the log
- * or stops writes; load order stays append order. */
+/* Keep file order monotone across clock steps without changing record dates. */
 static int today(Store *s, char *date, char *day, const char *newest)
 {
     time_t now;
@@ -1049,8 +1035,6 @@ static char *daily_path(Store *s, const char *subdir, const char *day)
     return path;
 }
 
-/* One write and one fsync for all of B. The directory needs syncing only
- * when the file is new. */
 static int append_lines(Store *s, const char *path, const Buf *b, off_t *offset)
 {
     int fd, created, result, err;
@@ -1161,7 +1145,6 @@ int store_append(Store *s, const Entry *e, size_t n, unsigned long *first,
     if (!result) {
         memcpy(s->main_day, day, sizeof(s->main_day));
         file = store_file(s, path);
-        /* Index what was written, validated exactly as a load would. */
         for (at = 0; !result && at < b.len; at = (size_t)(lf - b.s) + 1) {
             lf = memchr(b.s + at, '\n', b.len - at);
             *lf = 0;
@@ -1239,7 +1222,6 @@ int store_build(Store *s, Ref r, const char *text)
     return result;
 }
 
-/* The complete line at OFFSET of an indexed log. */
 static int line_at(Store *s, unsigned int file, off_t offset, Buf *line)
 {
     char chunk[8192], *lf;
@@ -1367,8 +1349,7 @@ char *store_text(Store *s, Ref r)
              json_ulong(json_get(j, "i"), &i) && i == r.i && text &&
              json_ulong(json_get(j, "size"), &size) && size == n->size &&
              strlen(text) == size ? xstrdup(text) : NULL;
-    /* store_slot also permits callers to populate an index directly. Capture
-     * those records on first validated read; log load/build captures eagerly. */
+    /* Directly populated slots have no fingerprint until their first read. */
     if (result && !n->fingerprinted) {
         fingerprint(n->fingerprint, line.s, line.len);
         n->fingerprinted = 1;
@@ -1404,7 +1385,6 @@ static unsigned long page_span(const char *text, size_t length, unsigned long p,
     return pages;
 }
 
-/* A child line's head inside a log reference, newlines as spaces. */
 static void line_head(Buf *b, Ref r, const char *text)
 {
     size_t n, k;
@@ -1515,7 +1495,7 @@ char *store_zoom(Store *s, unsigned long id, unsigned long n,
     return out.s;
 }
 
-/* The writer's records begin {"i":N, so skipping needs no full parse. */
+/* Fast path for the writer's field order; accept other valid JSON below. */
 static int record_id(const char *line, unsigned long *id)
 {
     const char *p;
@@ -1550,7 +1530,7 @@ static int open_reader(Store *s, Reader *r, const char *path)
     return r->fd < 0 ? io_fail(s, "cannot read log", path) : 0;
 }
 
-/* First record id of a daily log; *found is 0 if it has no complete line. */
+/* An empty or in-progress file has no first id (*found == 0). */
 static int first_id(Store *s, Reader *r, Buf *line, const char *path,
                     unsigned long *id, int *found)
 {
@@ -1588,7 +1568,7 @@ int store_log(Store *s, const char *dir, unsigned long from, unsigned long count
     result = list_logs(s, logs, &names, &n);
     r = xmalloc(sizeof(*r));
     buf_init(&line);
-    /* Newest first: recent pages open one or two files. */
+    /* Search backward so recent history need not scan old records. */
     start = 0;
     for (k = n; !result && k-- > 0;) {
         path = path_join(logs, names[k]);

@@ -5,9 +5,8 @@
 
 static void enqueue(Queue *q, Job j)
 {
-    if (q->head && q->head == q->n) {
+    if (q->head && q->head == q->n)
         q->head = q->n = 0;
-    }
     if (q->n == q->cap) {
         if (q->head) {
             memmove(q->v, q->v + q->head, (q->n - q->head) * sizeof(*q->v));
@@ -38,15 +37,13 @@ static unsigned long context_end(Job j)
     return ref_start(j.ref) + (j.ref.l ? ref_span(j.ref) : 0);
 }
 
-/* Fits the 32 KB context, judged from sizes alone. */
 static int fits(Engine *e, Job j)
 {
     return view_prefix(e->store, &e->compact, context_end(j), 1) <= COMPACT_HIGH;
 }
 
-/* Oversized jobs wait in a min-heap by their context's end. A built ancestor
- * cannot cross an unbuilt job, so these prefixes increase with the cutoff.
- * Only a view merge can make the smallest blocked prefix fit. */
+/* A built node cannot cross an unbuilt job. Context sizes therefore grow
+ * with the cutoff, so only the heap's first job needs a size check. */
 static void defer(Engine *e, Job j)
 {
     Queue *q;
@@ -56,7 +53,7 @@ static void defer(Engine *e, Job j)
     n = store_slot(e->store, j.ref);
     n->busy = 0;
     n->queued = NODE_DEFERRED;
-    j.retry = 1; /* a deferred leaf is already counted in inflight */
+    j.retry = 1;
     enqueue(q, j);
     i = q->n - 1;
     while (i) {
@@ -146,7 +143,9 @@ static int load_compact(Engine *e)
         view_copy(&e->compact, &e->store->view);
         e->compact.shrinking = 1;
         view_shrink(e->store, &e->compact, COMPACT_HIGH, COMPACT_LOW, 0);
-        return save_compact(e);
+        /* An absent empty view is reconstructible. Save nonempty initialization
+         * and later merges/batch changes before contexts depend on them. */
+        return e->store->count ? save_compact(e) : 0;
     }
     j = json_parse(text);
     free(text);
@@ -164,8 +163,7 @@ static int load_compact(Engine *e)
         view_add(&e->compact, r);
     }
     view_measure(e->store, &e->compact);
-    /* The pending marker is conservative: completing a batch early only
-     * changes the small compaction prefix, never the saved turn view. */
+    /* Resuming an extra compaction batch cannot change the saved turn view. */
     e->compact.shrinking = (int)shrinking || e->compact.bytes > COMPACT_HIGH;
     return 0;
 }
@@ -180,7 +178,6 @@ int engine_open(Engine *e, Store *s)
     view_init(&e->compact);
     if (load_compact(e) < 0)
         return -1;
-    /* One linear startup pass. From here on, completion enqueues parents. */
     for (i = 0; i < s->count; i++) {
         r.l = 0;
         r.i = i;
@@ -222,8 +219,8 @@ void engine_close(Engine *e)
     memset(e, 0, sizeof(*e));
 }
 
-/* Views are saved only when merges change them or a batch starts or ends:
- * appended leaves are recovered from the log at the next open. */
+/* Appended leaves are recovered from the log; only merges and batch-state
+ * changes require a view save. */
 static int update_views(Engine *e)
 {
     int changed, pending, compact_changed, compact_pending;
@@ -233,7 +230,6 @@ static int update_views(Engine *e)
     changed = view_shrink(s, &s->view, VIEW_HIGH, VIEW_LOW, 0);
     if (changed) {
         s->generation++;
-        /* The compactor follows a chat batch at exactly the same boundary. */
         view_copy(&e->compact, &s->view);
         e->compact.shrinking = 1;
     }
@@ -248,8 +244,7 @@ static int update_views(Engine *e)
     return 0;
 }
 
-/* The user's words retry failed work at once; the agent's own records do
- * not, or one busy turn would repeat a failing call hundreds of times. */
+/* Retrying on tool output would hammer a failing provider during a turn. */
 int engine_sync(Engine *e)
 {
     Ref r;
@@ -276,6 +271,7 @@ static void requeue(Engine *e, Job j)
     j.retry = 1;
     enqueue(&e->ready, j);
 }
+
 void engine_retry(Engine *e)
 {
     Job j;
@@ -285,8 +281,6 @@ void engine_retry(Engine *e)
     }
 }
 
-/* Failed nodes retry by themselves after 15, 60 and 300 seconds, then wait
- * for a new message or an explicit retry, so a dead provider costs little. */
 int engine_tick(Engine *e, long now)
 {
     Queue keep;
@@ -332,10 +326,10 @@ int engine_done(Engine *e, Job j, const char *text)
     char *cut;
     size_t len;
     int result;
-    /* A node far over the ruler would crowd every later context out of its
-     * 32 KB budget and could never merge away: cut it at a code point. */
+    /* An oversized node can block later jobs before they can merge it away. */
     cut = NULL;
-    if (strlen(text) > NODE_BYTES + NODE_SLACK) {
+    len = strlen(text);
+    if (len > NODE_BYTES + NODE_SLACK) {
         len = utf8_prefix(text, NODE_BYTES);
         cut = xmalloc(len + 1);
         memcpy(cut, text, len);
@@ -382,10 +376,7 @@ void engine_fail(Engine *e, Job j, long now)
     enqueue(&e->failed, j);
 }
 
-/* A source that fits in a line is its own node, with no model call: a short
- * message (kind: text) verbatim, two short lines joined by a newline. Sizes
- * decide; text is read only then. Returns the text, NULL if a model must
- * build it, or sets *error on a read failure. */
+/* NULL requests a model call, unless *error reports a source read failure. */
 static char *shortcut(Engine *e, Job j, int *error)
 {
     Store *s;
@@ -475,7 +466,6 @@ int engine_next(Engine *e, Job *j)
     }
 }
 
-/* The exact source shared by model tasks and terminal-outcome fallback. */
 static char *source(Engine *e, Job j)
 {
     Buf b;
@@ -506,9 +496,6 @@ static char *source(Engine *e, Job j)
     return b.s;
 }
 
-/* Only terminal refusal/answered-empty results may use this, never transport
- * failures. Mark the copy and its retrieval path; keep the whole node within
- * the ruler, flattening LF/CR exactly as the view does. */
 int engine_fallback(Engine *e, Job j)
 {
     char *text;

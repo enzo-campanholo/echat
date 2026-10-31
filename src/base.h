@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-/* Growable, NUL-terminated byte string. len excludes the terminator. */
+/* Growable byte string; s is NULL or NUL-terminated. len excludes NUL. */
 typedef struct Buf { char *s; size_t len, cap; } Buf;
 void *xmalloc(size_t n);
 void *xrealloc(void *p, size_t n);
@@ -20,16 +20,22 @@ void buf_json(Buf *b, const char *s);
 int read_line(FILE *f, Buf *b); /* 1: LF-terminated record; 0: EOF; -1: partial/error */
 char *read_file(const char *path);
 int write_all(int fd, const void *data, size_t n);
-int sync_fd(int fd); /* durable barrier: F_FULLFSYNC where defined, else fsync */
+int sync_fd(int fd);
 size_t utf8_prefix(const char *s, size_t n); /* complete codepoints in first n bytes */
 int utf8_valid(const char *s);
-char *clip_echo(const char *s, size_t chars); /* head + marker + tail: CHARS code points */
+char *clip_echo(const char *s, size_t chars); /* budget in code points, not bytes */
 char *path_join(const char *a, const char *b);
-int sync_parent(const char *path); /* sync the directory containing this name */
-/* Sync parents of new intermediate ancestors; caller syncs final parent. */
+int sync_parent(const char *path);
+/* Sync directories along the resolved path, including existing ancestors. */
 int mkdirs(const char *path);
+/* One setup may create several paths before its shared barrier. Always finish,
+ * even on failure (sync=0 discards). No acknowledgment before finish(sync=1).
+ * External namespace renames/replacements must not race these operations. */
+typedef struct DirSync DirSync;
+int mkdirs_pending(const char *path, DirSync **pending); /* *pending starts NULL */
+int finish_dirs(DirSync **pending, int sync); /* closes/frees and resets to NULL */
 
-/* A small strict JSON DOM. Strings are decoded; NUL in strings is rejected. */
+/* Strings are decoded UTF-8 without NUL. Duplicate object keys are rejected. */
 enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ };
 typedef struct Json Json;
 struct Json { int type; char *s; Json *child, *next; char *key; };

@@ -1,4 +1,3 @@
-/* Pi requires JavaScript extensions. Persistence, scheduling and the tree are C. */
 import { createHash } from "node:crypto";
 
 export const zoomSchema = {
@@ -23,7 +22,6 @@ export function registerMemory(pi, memory) {
     async execute(_id, args) {
       const { id, n = 1, page = 0 } = args;
       const result = await memory("zoom", { id, n, page });
-      /* The engine's short reference is what the log records (C4). */
       return { content: content(result), details: result.log ? { log: result.log } : undefined };
     },
   });
@@ -37,15 +35,14 @@ export function registerMemory(pi, memory) {
   });
 }
 
-/* The engine stores image blocks exactly as {type, data, mimeType}; a tool's
- * extra fields would make it refuse the whole record. */
+/* Extra image fields would fail the engine's record validation. */
 export function imageBlocks(content) {
   if (!Array.isArray(content)) return undefined;
   return content.filter(block => block?.type === "image")
     .map(({ type, data, mimeType }) => ({ type, data, mimeType }));
 }
 
-/* Split only LF, never Unicode paragraph separators. Keep byte prefixes stable. */
+/* Four-line cache blocks must preserve the rendered view's bytes. */
 export function chatBlocks(text) {
   if (!text.startsWith("<chat>\n")) return [{ type: "text", text }];
   const boundary = text.indexOf("\n</chat>\n", 6);
@@ -54,12 +51,14 @@ export function chatBlocks(text) {
   const lines = text.slice(7, end).split("\n");
   if (lines.at(-1) === "") lines.pop();
   const blocks = [];
+  const whole = lines.length - lines.length % 4;
   let head = "<chat>\n";
-  for (let i = 0; i + 4 <= lines.length; i += 4) {
+  for (let i = 0; i < whole; i += 4) {
     blocks.push({ type: "text", text: head + lines.slice(i, i + 4).join("\n") + "\n" });
     head = "";
   }
-  blocks.push({ type: "text", text: head + lines.slice(lines.length - lines.length % 4).map(s => s + "\n").join("") + text.slice(end) });
+  const tail = lines.slice(whole).map(line => line + "\n").join("");
+  blocks.push({ type: "text", text: head + tail + text.slice(end) });
   return blocks;
 }
 
@@ -76,10 +75,8 @@ export function stableContext(messages, system, tools) {
   ];
 }
 
-/* Cache the shared tools/system, the last four-line block, and request end.
- * With MEMORY (turns only), also the previous turn's last whole block while it
- * is unchanged: a turn that added more than ~20 blocks would otherwise leave
- * the new mark beyond Anthropic's lookback and rewrite the whole view. */
+/* Retain the previous turn's breakpoint while unchanged: a long turn can
+ * push the new breakpoint beyond Anthropic's cache lookback. */
 export function cachePayload(payload, providerTools, memory) {
   if (!payload || !Array.isArray(payload.messages) || !Array.isArray(payload.system) || !("max_tokens" in payload)) return { payload };
   if (providerTools) payload.tools = structuredClone(providerTools);
@@ -91,7 +88,8 @@ export function cachePayload(payload, providerTools, memory) {
       if (Array.isArray(block.content)) clean(block.content);
     }
   };
-  clean(payload.system); clean(payload.tools);
+  clean(payload.system);
+  clean(payload.tools);
   for (const message of payload.messages) clean(message.content);
   const base = payload.system.at(-1);
   if (base) base.cache_control = { type: "ephemeral" };
@@ -105,7 +103,7 @@ export function cachePayload(payload, providerTools, memory) {
       if (block.type !== "text") continue;
       if (block.text.startsWith("<chat>\n")) inChat = foundChat = true;
       if (inChat && /(^|\n)<\/chat>\n/.test(block.text)) break;
-      else if (inChat) {
+      if (inChat) {
         mark = block;
         prefix = [mi, bi];
       }
@@ -131,21 +129,16 @@ export function cachePayload(payload, providerTools, memory) {
   return { payload, key };
 }
 
-/* JSON.stringify writes a lone UTF-16 surrogate as an escape such as
- * "\ud800", which the engine's strict parser rejects by closing the channel.
- * Outgoing text replaces each with U+FFFD instead. */
+/* JSON.stringify escapes lone surrogates, but the engine rejects them. */
 const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 export function wellFormed(text) {
   return typeof text.toWellFormed === "function" ? text.toWellFormed() : text.replace(loneSurrogate, "�");
 }
 const wellFormedStrings = (_key, value) => typeof value === "string" ? wellFormed(value) : value;
 
-/* Summary calls belong to the engine that issued them. Call ids restart at 1
- * in each engine, so a call's cache gating and result must never reach a
- * later engine (after /unii restart). PERFORM(event, signal, send) does one
- * completion, gating through send, and returns text (legacy) or an explicit
- * result {outcome:"ok",text}, {outcome:"empty"} or {outcome:"refused"}.
- * Exceptions always remain retryable errors, never inferred refusals. */
+/* Call ids restart with each engine. Bind requests to that engine's Records,
+ * not the adapter's current backend, so late results cannot cross a restart.
+ * perform(event, signal, send) returns text or a protocol result object. */
 export class Calls {
   constructor(records, perform) {
     this.records = records;
@@ -166,19 +159,16 @@ export class Calls {
     } finally {
       if (this.live.get(event.call) === controller) this.live.delete(event.call);
     }
-    /* A cancelled call's late result is refused by the engine; that is fine. */
+    /* Cancelled calls and closed engines can reject a late result. */
     await this.records.request({ op: "result", call: event.call, ...outcome }).catch(() => {});
   }
   cancel(call) { this.live.get(call)?.abort(); }
-  /* The engine is going away: abort its calls and start no more. */
   close() {
     this.closed = true;
     for (const controller of this.live.values()) controller.abort();
   }
 }
 
-/* Strict JSONL transport to the C engine. Records with "event" are
- * notifications; everything else answers a request by id. */
 export class Records {
   constructor(input, output, notify = () => {}, onFailure = () => {}) {
     this.output = output;

@@ -84,7 +84,6 @@ static void buf_reserve(Buf *b, size_t n)
     b->cap = cap;
 }
 
-/* s must not point into b: growing b may move it. */
 void buf_add(Buf *b, const void *s, size_t n)
 {
     if (n > (size_t)-1 - b->len - 1)
@@ -242,9 +241,8 @@ int write_all(int fd, const void *data, size_t n)
     return 0;
 }
 
-/* fsync is no barrier on macOS: only F_FULLFSYNC flushes the drive cache.
- * Filesystems without it (some network mounts) fall back to fsync.
- * UNII_PLAIN_FSYNC (fault-injection builds only) always calls fsync. */
+/* F_FULLFSYNC also flushes the drive cache. Fall back on filesystems that
+ * do not support it; fault-injection builds use fsync directly. */
 int sync_fd(int fd)
 {
 #if defined(F_FULLFSYNC) && !defined(UNII_PLAIN_FSYNC)
@@ -254,8 +252,8 @@ int sync_fd(int fd)
     return fsync(fd);
 }
 
-/* Return the width of one scalar value, or zero for malformed input. */
-static size_t utf8_char(const char *s, size_t avail, unsigned long *value)
+/* Zero means an invalid or incomplete UTF-8 sequence. */
+static size_t utf8_char(const char *s, size_t avail)
 {
     const unsigned char *p;
     unsigned long c, min;
@@ -264,11 +262,8 @@ static size_t utf8_char(const char *s, size_t avail, unsigned long *value)
     if (!avail)
         return 0;
     c = p[0];
-    if (c < 128) {
-        if (value)
-            *value = c;
+    if (c < 128)
         return 1;
-    }
     if (c >= 0xc2 && c <= 0xdf) {
         n = 2;
         min = 0x80;
@@ -293,8 +288,6 @@ static size_t utf8_char(const char *s, size_t avail, unsigned long *value)
     }
     if (c < min || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff))
         return 0;
-    if (value)
-        *value = c;
     return n;
 }
 
@@ -303,7 +296,7 @@ size_t utf8_prefix(const char *s, size_t n)
     size_t i, width;
     i = 0;
     while (i < n && s[i]) {
-        width = utf8_char(s + i, n - i, NULL);
+        width = utf8_char(s + i, n - i);
         if (!width)
             break;
         i += width;
@@ -315,7 +308,7 @@ int utf8_valid(const char *s)
 {
     size_t width;
     while (*s) {
-        width = utf8_char(s, 4, NULL);
+        width = utf8_char(s, 4);
         if (!width)
             return 0;
         s += width;
@@ -334,7 +327,7 @@ char *clip_echo(const char *s, size_t chars)
     tail_count = chars - (sizeof(marker) - 1) - head_count;
     head = s;
     for (p = s; *p; p += width) {
-        width = utf8_char(p, 4, NULL);
+        width = utf8_char(p, 4);
         if (!width) {
             errno = EINVAL;
             return NULL;
@@ -348,7 +341,7 @@ char *clip_echo(const char *s, size_t chars)
     skip = count - tail_count;
     tail = s;
     while (skip--) {
-        width = utf8_char(tail, 4, NULL);
+        width = utf8_char(tail, 4);
         tail += width;
     }
     buf_init(&b);
@@ -369,7 +362,6 @@ char *path_join(const char *a, const char *b)
     return out.s;
 }
 
-/* A name is durable only after its parent directory is synced. */
 int sync_parent(const char *path)
 {
     char *dir, *slash;
@@ -383,10 +375,13 @@ int sync_parent(const char *path)
         slash[1] = 0;
     else if (slash)
         *slash = 0;
-    fd = open(slash ? dir : ".", O_RDONLY);
+    fd = open(slash ? dir : ".", O_RDONLY | O_DIRECTORY);
+    err = errno;
     free(dir);
-    if (fd < 0)
+    if (fd < 0) {
+        errno = err;
         return -1;
+    }
     result = sync_fd(fd);
     err = errno;
     if (close(fd) < 0 && !result) {
@@ -397,17 +392,214 @@ int sync_parent(const char *path)
     return result;
 }
 
-static int make_dir(const char *path, int intermediate)
+struct DirSync {
+    dev_t dev;
+    ino_t ino;
+    int fd;
+    DirSync *next;
+};
+
+/* Deduplicate barriers, not traversal: bind aliases can share an inode but
+ * have different namespace parents. Keep descriptors only for this setup. */
+static int collect_dir(int dir, DirSync **pending)
 {
     struct stat st;
-    if (!mkdir(path, 0700))
-        return intermediate ? sync_parent(path) : 0;
-    if (errno != EEXIST)
+    DirSync *p;
+    int fd;
+    if (fstat(dir, &st) < 0)
         return -1;
-    if (stat(path, &st))
+    for (p = *pending; p; p = p->next)
+        if (p->dev == st.st_dev && p->ino == st.st_ino)
+            return 0;
+    fd = dup(dir);
+    if (fd < 0)
         return -1;
-    if (!S_ISDIR(st.st_mode)) {
-        errno = ENOTDIR;
+    p = xmalloc(sizeof(*p));
+    p->dev = st.st_dev;
+    p->ino = st.st_ino;
+    p->fd = fd;
+    p->next = *pending;
+    *pending = p;
+    return 0;
+}
+
+static char *current_dir(void)
+{
+    char *path;
+    size_t size;
+    int err;
+    path = NULL;
+    size = 128;
+    for (;;) {
+        path = xrealloc(path, size);
+        if (getcwd(path, size))
+            return path;
+        if (errno != ERANGE)
+            break;
+        if (size > (size_t)-1 / 2) {
+            errno = ENAMETOOLONG;
+            break;
+        }
+        size *= 2;
+    }
+    err = errno;
+    free(path);
+    errno = err;
+    return NULL;
+}
+
+static char *link_target(int fd, const char *name)
+{
+    char *s;
+    size_t size;
+    ssize_t n;
+    int err;
+    size = 128;
+    s = NULL;
+    for (;;) {
+        s = xrealloc(s, size + 1);
+        n = readlinkat(fd, name, s, size);
+        if (n < 0)
+            break;
+        if ((size_t)n < size) {
+            s[n] = 0;
+            return s;
+        }
+        if (size > (size_t)SSIZE_MAX / 2) {
+            errno = ENAMETOOLONG;
+            break;
+        }
+        size *= 2;
+    }
+    err = errno;
+    free(s);
+    errno = err;
+    return NULL;
+}
+
+/* Resolve components rather than normalizing strings: '..' after a symlink
+ * belongs to its target. Walking link text also covers intermediate links and
+ * prefixes absent from the final ancestry. Never create a dangling target. */
+static int prepare_path(int base, const char *path, DirSync **pending,
+                        unsigned int *links, int create)
+{
+    struct stat st;
+    char *copy, *p, *end, *target;
+    int fd, next, created, err;
+    copy = xstrdup(path);
+    p = copy;
+    if (*p == '/') {
+        while (*p == '/')
+            p++;
+        err = *p;
+        *p = 0;
+        fd = open(copy, O_RDONLY | O_DIRECTORY);
+        *p = (char)err;
+    } else {
+        fd = openat(base, ".", O_RDONLY | O_DIRECTORY);
+    }
+    if (fd < 0)
+        goto fail;
+    if (collect_dir(fd, pending) < 0)
+        goto fail;
+    while (*p) {
+        end = strchr(p, '/');
+        if (end)
+            *end = 0;
+        created = 0;
+        if (fstatat(fd, p, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+            if (errno != ENOENT || !create || mkdirat(fd, p, 0700) < 0)
+                goto fail;
+            created = 1;
+        }
+        if (!created && S_ISLNK(st.st_mode)) {
+            if ((*links)++ == 40) {
+                errno = ELOOP;
+                goto fail;
+            }
+            target = link_target(fd, p);
+            if (!target)
+                goto fail;
+            next = prepare_path(fd, target, pending, links, 0);
+            err = errno;
+            free(target);
+            errno = err;
+        } else {
+            next = openat(fd, p, O_RDONLY | O_DIRECTORY);
+        }
+        if (next < 0)
+            goto fail;
+        if (close(fd) < 0) {
+            err = errno;
+            close(next);
+            fd = -1;
+            errno = err;
+            goto fail;
+        }
+        fd = next;
+        /* Existence does not prove a previous setup synced this directory. */
+        if (collect_dir(fd, pending) < 0)
+            goto fail;
+        if (!end)
+            break;
+        for (p = end + 1; *p == '/'; p++)
+            ;
+    }
+    free(copy);
+    return fd;
+fail:
+    err = errno;
+    if (fd >= 0)
+        close(fd);
+    free(copy);
+    errno = err;
+    return -1;
+}
+
+int mkdirs_pending(const char *path, DirSync **pending)
+{
+    char *cwd, *absolute;
+    unsigned int links;
+    int fd, err;
+    if (!*path) {
+        errno = EINVAL;
+        return -1;
+    }
+    absolute = NULL;
+    /* Walk from the namespace root so cwd ancestors need no inode root test.
+     * Only cwd is canonical; leave the requested symlinks and '..' intact. */
+    if (*path != '/') {
+        cwd = current_dir();
+        if (!cwd)
+            return -1;
+        absolute = path_join(cwd, path);
+        free(cwd);
+        path = absolute;
+    }
+    links = 0;
+    fd = prepare_path(AT_FDCWD, path, pending, &links, 1);
+    err = errno;
+    free(absolute);
+    errno = err;
+    return fd < 0 ? -1 : close(fd);
+}
+
+/* Always release the entire set, including after an error. */
+int finish_dirs(DirSync **pending, int sync)
+{
+    DirSync *p;
+    int err;
+    err = 0;
+    while ((p = *pending) != NULL) {
+        *pending = p->next;
+        if (sync && !err && sync_fd(p->fd) < 0)
+            err = errno;
+        if (close(p->fd) < 0 && !err)
+            err = errno;
+        free(p);
+    }
+    if (err) {
+        errno = err;
         return -1;
     }
     return 0;
@@ -415,34 +607,16 @@ static int make_dir(const char *path, int intermediate)
 
 int mkdirs(const char *path)
 {
-    char *copy, *p;
-    int e;
-    if (!*path) {
-        errno = EINVAL;
+    DirSync *pending;
+    int err;
+    pending = NULL;
+    if (mkdirs_pending(path, &pending) < 0) {
+        err = errno;
+        finish_dirs(&pending, 0);
+        errno = err;
         return -1;
     }
-    copy = xstrdup(path);
-    for (p = copy + 1; *p; p++) {
-        if (*p == '/' && p[-1] != '/') {
-            *p = 0;
-            if (make_dir(copy, 1)) {
-                e = errno;
-                free(copy);
-                errno = e;
-                return -1;
-            }
-            *p = '/';
-        }
-    }
-    /* The caller syncs the final directory's parent as part of its own
-     * durable setup; intermediate ancestors have no later sync point. */
-    e = make_dir(copy, 0) ? errno : 0;
-    free(copy);
-    if (e) {
-        errno = e;
-        return -1;
-    }
-    return 0;
+    return finish_dirs(&pending, 1);
 }
 
 typedef struct Parser { const char *p; int depth; } Parser;
@@ -507,13 +681,12 @@ static char *string(Parser *p)
     p->p++;
     buf_init(&b);
     for (;;) {
-        /* Copy a run of plain bytes at once, validating UTF-8 as it goes. */
         for (run = p->p; (unsigned char)*p->p >= 32 && *p->p != '"' && *p->p != '\\';) {
             if ((unsigned char)*p->p < 128) {
                 p->p++;
                 continue;
             }
-            width = utf8_char(p->p, 4, NULL);
+            width = utf8_char(p->p, 4);
             if (!width)
                 goto bad;
             p->p += width;
@@ -522,7 +695,7 @@ static char *string(Parser *p)
         if (*p->p == '"')
             break;
         if (*p->p != '\\')
-            goto bad; /* NUL or a control character */
+            goto bad;
         p->p++;
         ch = (unsigned char)*p->p;
         if (!ch)

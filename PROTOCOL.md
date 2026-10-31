@@ -1,15 +1,12 @@
 # UniiChat engine protocol (version 1)
 
-`unii serve DIR` is UniiChat's memory engine. It owns all memory policy:
-what is logged, when a node is built, the context each summary sees, the
-ruler and length corrections, the five-attempt rule, the size ceiling,
-timeouts, retries, concurrency and cache gating. A **host** (the pi
-extension `pi/unii.ts`, or any other program) owns the model, its system
-prompt, its tools and the user interface. The host performs the model calls
-the engine asks for.
+`unii serve DIR` reads requests on stdin and writes responses and events on
+stdout. The engine handles storage, summary scheduling, context limits,
+retries, timeouts and cache gating. The host supplies model calls, the system
+prompt, tool definitions and the UI. `pi/unii.ts` is one such host.
 
-The second half of this document is the on-disk format, which is a stable
-contract for readers in its own right.
+The [on-disk format](#on-disk-format-reader-contract) also supports readers
+that do not use the engine protocol.
 
 ## Framing
 
@@ -23,8 +20,7 @@ contract for readers in its own right.
   replace them with U+FFFD before encoding.
 - A line that does not parse as a JSON object gets one
   `{"id":null,"ok":false,"error":"invalid JSON request"}` and the engine
-  exits: an unparsed request has no trustworthy id, and closing the channel
-  rejects every waiter instead of stranding one.
+  exits. Without a trustworthy id, the host must reject all pending requests.
 
 ## Records
 
@@ -35,9 +31,9 @@ Every output line is either a **response** or an **event**.
   (any JSON value; `null` if the request had none). Hosts should use
   numbers or strings.
 - A response with `"fatal":true` means durable storage failed: the engine
-  stops, and the host must stop using memory (the log on disk is intact up
-  to the failure). A fatal response may carry the id of an unrelated waiting
-  request, or `null`.
+  stops, and the host must reject all pending requests. A fatal response may
+  carry the id of an unrelated waiting request, or `null`. Preserve the logs
+  for recovery; failed writes may have left unacknowledged bytes.
 - An event has an `"event"` field and never an `"id"` field.
 
 Requests are answered in the order they are dispatched, except `turn`,
@@ -57,39 +53,35 @@ messages in the log; `summarized` the length of the prefix whose leaves are
 built. The `summary_` fields name the model that writes summaries:
 `unii serve --provider/--model/--effort`, else `UNII_PROVIDER`,
 `UNII_MODEL` and `UNII_EFFORT`, else `openai-codex`, `gpt-6-luna` and
-`xhigh`. (Each `call` event names its own.)
+`xhigh`. Each `call` event includes these settings.
 
-`configure` is the protocol-0 form: it also starts model work, enables
-events only if `"events":true`, and ignores its old `system`, `tools` and
-`provider_tools` fields (the host owns those now). Protocol 0 returned
-`append`'s `message_id` as a JSON string (`"0"`); it is now a number for
-every host, as documented below.
+For protocol-0 hosts, `configure` starts model work and enables events only
+if `"events":true`. It ignores `system`, `tools` and `provider_tools`.
+`append` returns numeric `message_id` values, not protocol 0's strings.
 
 ### turn
 
 `{"id":2,"op":"turn","text":"...","images":[...]}` ->
 `{"id":2,"ok":true,"view":"<chat>\n...</chat>\n"}`
 
-Logs `text` (and optional image blocks) as a `user` message, then waits
-until every earlier message is summarized and the view rendered before the
-new message fits in 128,000 bytes. The response's `view` is that rendering:
-the host sends it, then the message, in a fresh model context. Errors (the
-input stays logged; the next `user` message retries): a summary failed or is
-blocked, or the view cannot fit.
+Logs `text` and optional images as a `user` message. Unless the `<recent>`
+exception below applies, it waits for all earlier leaves to be summarized
+and the view before the new message to fit in 128,000 bytes. The host sends
+that `view`, then the message, in a fresh model context. If summaries fail
+or remain blocked, or the view cannot fit, the request fails but its input
+stays logged.
 
 One `turn` or `flush` waits at a time. A `turn` that arrives while a
 `flush` waits ends that flush with the error `flush superseded by a turn`
-and proceeds normally, so typed input is never refused for a flush. A
+and proceeds normally. A
 `turn` or `flush` that arrives while a turn waits, or a `flush` while a
 flush waits, is refused (`another turn is waiting for memory`) and logs
 nothing.
 
-The engine does not wait when both of these hold: the `<recent>` block
-below for the messages before the turn that are not summarized yet (tags,
-headers and texts) fits in 32,000 bytes, and the view up to the first of
-them fits in 128,000 bytes. The response is then
-`{"ok":true,"view":V,"recent":R}`, where `V` is that view (still only
-summaries) and `R` holds those messages whole:
+The turn need not wait if unsummarized earlier messages fit whole in a
+32,000-byte `<recent>` block, including tags and headers, and the view before
+the first of them fits in 128,000 bytes. The response includes `view` and
+`recent`; the view still contains only summaries. For example:
 
 ```
 <recent>
@@ -99,12 +91,13 @@ full text, newlines kept
 </recent>
 ```
 
-The host places `R` after the view and before its per-turn state. `recent`
-is absent when memory has caught up. If either bound fails, the turn waits
-as above.
-(This is a deliberate change from the spec; building with `TAIL_BYTES` 0,
-for example `make CPPFLAGS='-D_POSIX_C_SOURCE=200809L -DTAIL_BYTES=0'`,
-restores the spec's wait.)
+Place `recent` after the view and before per-turn state. It is absent when
+memory has caught up. If either bound fails, the turn waits. To disable
+this exception, build with `TAIL_BYTES=0`:
+
+```sh
+make -B CPPFLAGS='-D_POSIX_C_SOURCE=200809L -DTAIL_BYTES=0'
+```
 
 Images are pi blocks `{"type":"image","data":BASE64,"mimeType":"image/..."}`.
 
@@ -121,14 +114,14 @@ arrived while it waited (`flush superseded by a turn`).
 
 Logs a message. `kind` is one of `user`, `unii`, `tool`, `echo`, `work`,
 `note`; `message_id` is the first id used (long text is split into several
-messages of at most 30,000 bytes; `echo` text is clipped to 30,000
-characters, head and tail). `steer` is `append` with kind `user`, for input
+messages of at most 30,000 bytes; `echo` instead keeps its head and tail
+within 30,000 code points). `steer` is `append` with kind `user`, for input
 that arrives while a turn runs.
 
 `{"id":4,"op":"append","records":[{"kind":"unii","text":"..."},{"kind":"tool","text":"..."}]}`
-logs several entries, in order, with one write and one fsync (for example an
-assistant message's replies and tool calls). Invalid kinds, text or images
-are an ordinary error and log nothing; a storage failure is fatal.
+logs the entries in order as one append batch with one sync. Invalid kinds,
+text or images are ordinary errors and log nothing; storage failures are
+fatal. Images go only with the first part of a split message.
 
 ### zoom, date
 
@@ -137,21 +130,23 @@ are an ordinary error and log nothing; a storage failure is fatal.
 
 `n` is a power of two and `id` a multiple of `n`. `n > 1` opens the node
 into its two children; `n = 1` returns message `id` whole in pages of at
-most 30,000 bytes, with `"images"` on page 0 if it has any. An impossible
-range is an ordinary error the model can correct.
+most 30,000 body bytes, plus a header, with `"images"` on page 0 if present.
+Do not clip the page again: omitted body bytes would be unretrievable.
 
 A successful zoom also carries `"log"`, a line of under 512 bytes such as
 `zoom {"id":5,"n":1,"page":0}: message 5 page 0/1, 8123 bytes; not copied;
-zoom again to read` (for `n > 1`, the heads of the two child lines). Log
-that as the tool result's `echo`, without images, instead of the result:
-the tree already holds what zoom shows.
+zoom again to read`. For `n > 1`, it includes the heads of both child lines.
+Log this reference as the tool result's `echo`, without images, instead of
+copying the retrieved text.
 
 `{"id":6,"op":"date","args":{"id":0}}` -> `{"id":6,"ok":true,"text":"2026-10-09T12:00:00Z"}`
 
-Arguments are read only from `args`: a top-level `id` is the request's
-correlation id. Missing or invalid arguments are answered with `ok:true`
-and a `text` saying so (for example `zoom: id, n and page must be
-nonnegative integers`), for the model to read and correct.
+Arguments come only from `args`; top-level `id` is the correlation id.
+Missing or non-integer arguments return `ok:true` with an explanation in
+`text`. Invalid zoom alignments, ranges and pages return `ok:false`. A date
+lookup for a nonexistent message returns `ok:true` with `date: no such
+message`. These are recoverable tool errors; unreadable indexed storage
+is fatal.
 
 ### messages
 
@@ -159,8 +154,9 @@ nonnegative integers`), for the model to read and correct.
 `{"id":12,"ok":true,"records":[{"i":N,"kind":"user","date":"...","size":4,"text":"...","has_images":true},...],"next":M}`
 
 History by permanent id: records `[N, N+K)` that exist (`count` defaults to
-100). The first record is always returned; later ones stop once the response
-passes `bytes` (default and maximum 1 MiB). `next` is the first id not
+100). If any records are requested and available, the first is returned even
+if it exceeds `bytes` (default and maximum 1 MiB). Later records stop once
+the response reaches that budget. `next` is the first id not
 returned: page on with `from = next`, and stop when `next` reaches the log's
 end (`messages` from `hello` or `status`, or the last `append` event).
 Image blocks are included only with `"images":true`. Every record is
@@ -170,11 +166,10 @@ re-validated against the log; an unreadable one is fatal.
 
 `{"id":13,"op":"retry"}` -> `{"id":13,"ok":true}`
 
-Retries every failed node now, without logging a message. Failed nodes also
-retry by themselves 15, 60 and 300 seconds after each failure, then wait
-for a new message of kind `user` (a `turn`, `steer` or `append`) or
-`retry`, which restart that schedule. Other kinds (replies, tool calls and
-results, reports, notes) never do: a busy turn writes hundreds of them.
+Requeues failed nodes without logging a message and resets their retry
+schedule. Automatic retries wait 15, 60 and 300 seconds after successive
+failures, then stop. A new `user` message through `turn`, `steer` or `append`
+also resets the schedule. Other message kinds do not trigger retries.
 
 ### status
 
@@ -214,10 +209,11 @@ state between calls. Up to eight calls are outstanding at once.
 `{"id":9,"op":"result","call":N,"text":"the summary line"}` or
 `{"id":9,"op":"result","call":N,"error":"why"}` -> `{"id":9,"ok":true}`
 
-The text of the assistant's reply (text blocks joined with LF; thoughts
-excluded). `"outcome":"ok"` may accompany successful text. Legacy text-only
-results remain supported, including empty/ASCII-whitespace-only text, which
-is treated as an answered-empty completion.
+Send the assistant's text blocks joined with LF, excluding thoughts.
+`"outcome":"ok"` is optional. Text-only results remain supported; empty or
+ASCII-whitespace-only text is an answered-empty completion. The response
+acknowledges receipt, not persistence of a summary; a storage failure can
+follow as a fatal response.
 
 Terminal model outcomes may instead be reported explicitly:
 
@@ -226,30 +222,34 @@ Terminal model outcomes may instead be reported explicitly:
 {"id":9,"op":"result","call":N,"outcome":"refused"}
 ```
 
-`empty` means a completed model answer with no non-whitespace text, not a
-missing reply. `refused` requires an explicit model/provider refusal outcome;
-never infer it from a generic exception or error-message wording. Either
-finishes a leaf or merge with the shortest earlier answer, if any, otherwise
-a marked source excerpt with a `zoom` reference, flattened and bounded to
-512 UTF-8 bytes. A source read failure is fatal, not fallback material.
-Original records are unchanged.
+`empty` means an answered completion without non-whitespace text, not a
+missing reply. `refused` requires an explicit model/provider outcome, not an
+exception or a match against error wording. Either finishes the node with
+the shortest earlier answer, or a marked source excerpt with a `zoom`
+reference. The excerpt is flattened and bounded to 512 UTF-8 bytes. Source
+read failures are fatal. Original records are unchanged.
 
-Infrastructure/auth/network/timeout/aborted calls and replies that called a
-tool must use `error`; these remain retryable and never fabricate a summary.
+Infrastructure, authentication, network, timeout and abort failures, and
+replies that called a tool, must use `error`. These remain retryable and do
+not build a node. The pi adapter checks Responses function/custom-tool calls
+in raw item events and terminal `response.output`, even if normalized content
+omits them. A successful structured terminal response and normalized `done`
+are still required; raw refusal fragments alone do not authorize fallback.
 An `error` wins over any contradictory `outcome`. Unknown outcomes and missing
 text without a terminal outcome are retryable failures. A result for an
 unknown or cancelled call gets `ok:false` and is otherwise ignored; it is not
 fatal.
 
-These are additive protocol-1 fields. Older hosts still work; older engines
-ignore `outcome` and treat terminal results without text as retryable errors.
-Update the engine and host together to enable terminal fallback.
+`outcome` is an additive protocol-1 field. Older engines ignore it and treat
+terminal results without text as retryable errors. Update host and engine
+together to enable fallback. The pi adapter has known provider-classification
+[limitations](README.md#known-limitations).
 
 ### event cancel
 
 `{"event":"cancel","call":N}`: the call exceeded `unii serve --timeout`
-(or `UNII_TIMEOUT`; default 300 seconds, monotonic clock). Abort it; its
-result is refused.
+(or `UNII_TIMEOUT`; default 300 seconds, monotonic clock). Abort it; late
+results are rejected.
 
 ### event error
 
@@ -271,16 +271,16 @@ chat without polling:
 
 ## Prompt-cache gating
 
-A request whose cache-marked prefix another request is writing should wait
-until that request's response starts, so the prefix is paid for once. One
-gate serves turns and calls alike (prefixes are per model, so turns and
-summaries share entries only when they use the same model).
+Requests sharing a cache-marked prefix coordinate through one gate for
+turns and summaries. A writer holds its key until the host signals that the
+response started. Prefix keys must distinguish models. This coordinates
+requests; it does not guarantee a provider cache hit.
 
 - `{"id":10,"op":"cache_wait","key":K}` (turn) or with `"call":N` (a call's
   request) -> `{"id":10,"ok":true}` once no other request holds `K`; the
   requester then holds `K`. One waiting `cache_wait` per requester.
 - `{"id":11,"op":"cache_started","key":K}` (with `"call":N` for calls):
-  the response started, so the entry exists: every waiter on `K` proceeds.
+  the host signals that the response started; every waiter on `K` proceeds.
 - A requester's next `cache_wait`, or the end of its call, releases what it
   held without a started response; then the first waiter becomes the
   writer.
@@ -301,28 +301,35 @@ CHAT/
   *.jsonl.torn             set-aside torn final records (never read)
 ```
 
-- Logs are append-only daily JSONL; a line is never edited or removed.
+- Logs are append-only daily JSONL, except for repair of unterminated tails.
   Message ids are consecutive from 0 in file-name order, then line order.
   Node (l, i) covers messages `i*2^l` to `(i+1)*2^l - 1`; children precede
   their parent.
-- `size` is the UTF-8 byte length of `text`. `date` is UTC
-  (`YYYY-MM-DDTHH:MM:SSZ`, or with a `+HH:MM` offset). A record's day may be
-  earlier than its file's day (after a clock step), never later.
+- `size` is the UTF-8 byte length of `text`. Writers emit UTC `date` values
+  (`YYYY-MM-DDTHH:MM:SSZ`); readers also accept signed `HH:MM` offsets. A
+  record's day may precede its file's day after a clock step, never follow it.
 - Views are replaced atomically (write, fsync, rename, fsync directory).
   A view lists `[l, i]` pairs covering messages `0..` contiguously; it may
   end before the log does (messages logged since are appended as leaves).
 - A final line without LF in the newest file is a write in progress (or, to
   the writer, an unacknowledged torn record). Anything else malformed is
   corruption.
-- While an indexed store is open, full-record SHA-256 fingerprints detect
-  changes to message and summary JSON bytes (including dates and attachments)
-  when those records are reread. Fingerprints are not persisted and do not
-  authenticate valid modifications made before indexing/restart. Reads do not
-  rescan every original underlying a summary; this is scoped live-index change
-  detection, not cryptographic authentication. The on-disk format is unchanged.
-- Writers sync the parent of every newly created directory in the chat path,
-  including newly created ancestors, before acknowledging persistent writes.
-  Directory-sync failures are errors. Read-only operations create/sync nothing.
+- Rereads compare SHA-256 fingerprints of the original JSON record bytes,
+  excluding LF, including dates and attachments. Fingerprints last only for
+  the open index; they do not authenticate edits made before indexing or
+  restart. Reading a summary does not rescan its source messages.
+- Before acknowledging writes, writers batch directory barriers across log
+  directories, chat and every ancestor through the namespace root. Paths are
+  walked from that root; directory identity deduplicates barriers within one
+  open, but never stops traversal. Preexisting directories are synced on every
+  reopen, as are new directory objects and their parents. Initial empty
+  view/journal saves share setup's directory barrier; later view replacement
+  still persists the journal first. An empty chat's compaction view needs no file
+  until nonempty initialization, merges or batch changes require saved state. Relative-path cwd ancestors, symlink chains,
+  target prefixes and `..` are included. Failed/interrupted setup cannot skip
+  a required barrier via `EEXIST`. Directory-open, sync and close failures are
+  errors. The directory namespace must not be externally renamed/replaced while
+  the writer runs; the engine's lock is advisory. Readers create and sync nothing.
 
 ### Reading while the engine runs
 
@@ -348,5 +355,4 @@ create, lock or write a chat, and work while `unii serve` runs.
 `[FROM, FROM+COUNT)` (to the end without COUNT). It does not build the
 index: it reads the first record of each daily file, newest first, to find
 the file holding `FROM`, then streams. Each printed record is validated.
-This is the cheap way to page scrollback, or to poll for new messages
-(`unii log DIR LAST+1`).
+Use this to page scrollback or read messages after the last known id.

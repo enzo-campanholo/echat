@@ -93,7 +93,6 @@ void view_line(Buf *b, Ref r, const char *text)
     buf_putc(b, '\n');
 }
 
-/* The bytes view_line writes for a node, from its size alone. */
 static size_t line_size(Store *s, Ref r)
 {
     Node *node;
@@ -109,10 +108,9 @@ static size_t line_size(Store *s, Ref r)
     return size;
 }
 
-/* Visit the prefix's lines before END: open only the node crossing END. Its
- * children exist; this keeps the saved view's merges and never exposes a
- * later message. built_only stops at the first unbuilt line. Returns 0 to
- * stop, -1 on a read error. With B, render; otherwise add sizes to *bytes. */
+/* Open crossing nodes rather than changing the saved view or exposing later
+ * messages. With b, render; otherwise count bytes. Return 0 to stop, -1 on
+ * a read error. */
 static int prefix(Store *s, Ref r, unsigned long end, int built_only, Buf *b,
                   size_t *bytes)
 {
@@ -195,9 +193,8 @@ size_t view_measure(Store *s, View *v)
     return v->bytes;
 }
 
-/* Compare exact rational ages without floating point or cross-product overflow.
- * The pair ends at end-1; count is T, so numerator is T-end+1.
- * All denominators are powers of two. Equal ages retain the older pair. */
+/* Pair age is (count - pair_end + 1) / child_span. Compare quotients, then
+ * scale remainders by powers of two to avoid cross-product overflow. */
 static int more_due(unsigned long count, Ref a, Ref b)
 {
     unsigned long an, bn, ad, bd, aq, bq, ar, br;

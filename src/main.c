@@ -12,14 +12,11 @@
 #define SPEC_PENDING "A\nmessage not summarized yet shows as \"(not summarized yet: zoom it)\"."
 #define TAIL_PENDING "Messages\nnot summarized yet follow the view whole, inside <recent> tags."
 
-/* pi/prompt.txt, built in one string per line (see the Makefile). */
 static const char *const prompt[] = {
 #include "prompt.h"
     NULL
 };
 
-/* One outstanding model call per slot. The host performs it statelessly:
- * each attempt resends the whole conversation, corrections included. */
 typedef struct Call {
     Job job;
     unsigned long id; /* 0: idle */
@@ -29,16 +26,14 @@ typedef struct Call {
     Buf messages; /* comma-separated message objects */
 } Call;
 
-/* Cache gating per requester: [0] is the turn, [k + 1] is call slot k. A held
- * key's request is writing that prefix and has no response yet; a requester
- * with the same key waits, so the prefix is paid for once. */
+/* A held prefix has no response yet; requests sharing it wait for the writer. */
 typedef struct Gate { char *hold, *key; Json *wait; } Gate;
 
 typedef struct Server {
     Store store;
     Engine engine;
     Call calls[WORKERS];
-    Gate gates[WORKERS + 1];
+    Gate gates[WORKERS + 1]; /* 0: turn; k + 1: calls[k] */
     const char *provider, *model, *effort;
     long timeout; /* seconds per call */
     unsigned long serial, before;
@@ -53,7 +48,6 @@ typedef struct Server {
 static volatile sig_atomic_t interrupted;
 static void on_signal(int sig) { (void)sig; interrupted = 1; }
 
-/* Timeouts survive wall-clock steps. */
 static long seconds(void)
 {
     struct timespec t;
@@ -76,7 +70,6 @@ static void emit(Buf *b)
     buf_free(b);
 }
 
-/* Every response is {"id":ID,"ok":...} plus fields; keys are plain ASCII. */
 static void begin(Buf *b, const Json *req, int ok)
 {
     const Json *id;
@@ -133,9 +126,7 @@ static void storage_error(Server *s, const Json *req)
     response(req, -1, "error", s->store.error);
 }
 
-/* zoom and date for the model. Bad arguments and ranges are ordinary errors
- * it can correct; only an unreadable log (-1) is fatal. A zoom response also
- * carries "log": a short reference to record instead of the result. */
+/* Bad arguments are tool errors; unreadable storage (-1) is fatal. */
 static int memory(Server *s, const Json *req, const char *op, const Json *args)
 {
     unsigned long id, n, page;
@@ -208,7 +199,6 @@ static int running(Server *s)
     return n;
 }
 
-/* The summary model, as hello and status report it (calls name their own). */
 static void summary_model(Buf *b, const Server *s)
 {
     key_str(b, "summary_provider", s->provider);
@@ -232,8 +222,6 @@ static void status(Server *s, const Json *req)
     finish(&b);
 }
 
-/* Log entries in one write. The append event names their kind when all
- * share one. */
 static int append(Server *s, const Entry *e, size_t n, unsigned long *first)
 {
     Buf b;
@@ -269,8 +257,7 @@ static void built(void *opaque, Ref r)
     finish(&b);
 }
 
-/* Records [from, from + count): at least one, then up to a byte budget.
- * Images only when asked; "next" is the first id not returned. */
+/* Include the first record even if it exceeds the byte budget. */
 static int history(Server *s, const Json *req)
 {
     unsigned long from, count, end, budget, i;
@@ -345,8 +332,7 @@ static int held(Server *s, const char *key)
     return 0;
 }
 
-/* A started response wrote the entry, so every waiter can read it. An
- * abandoned request wrote nothing: its first waiter becomes the writer. */
+/* Without a response, promote one waiter to writer; otherwise release all. */
 static void release(Server *s, Gate *g, int written)
 {
     char *key;
@@ -467,9 +453,7 @@ static void failed_job(Server *s, Call *c, const char *why)
     end_call(s, c, 0);
 }
 
-/* An answered refusal/empty reply cannot be repaired by retrying this source.
- * Keep an earlier answer if any; otherwise record a bounded source excerpt.
- * Infrastructure/auth/network/timeout failures never enter this path. */
+/* Never use source fallback for provider or storage failures. */
 static int terminal_answer(Server *s, Call *c)
 {
     int result;
@@ -479,8 +463,6 @@ static int terminal_answer(Server *s, Call *c)
     return result;
 }
 
-/* Keep the shortest of at most ATTEMPTS answers; correct in the same
- * conversation, cutting the over-long line at the limit. */
 static int answer(Server *s, Call *c, const char *line)
 {
     Buf correction;
@@ -547,8 +529,6 @@ static int start_call(Server *s, Call *c)
     return 0;
 }
 
-/* While a turn or flush waits, report how many earlier messages still lack
- * a summary, on change only, so the wait is never silent. */
 static void progress(Server *s)
 {
     Buf b;
@@ -579,12 +559,9 @@ static void recent_images(Buf *b, unsigned long i)
     buf_puts(b, ",1))\n");
 }
 
-/* Spec change C2: rather than wait for the summaries of the messages before
- * the turn, send them whole after the view, if they fit in TAIL_BYTES. The
- * view stops at the first unbuilt leaf, so it still holds only summaries and
- * never part of a message; no built node crosses that leaf, so this view is
- * a prefix of the caught-up one and the cached prefix holds. Returns 1 if
- * answered, 0 if the turn must wait, -1 on a storage failure. */
+/* No built node crosses the first unbuilt leaf, so stopping there preserves
+ * the cached view prefix. Send the remaining messages whole in <recent>.
+ * Return 1 if answered, 0 to wait, -1 on storage failure. */
 static int answer_recent(Server *s, const Json *req)
 {
     Buf b, scratch;
@@ -656,8 +633,6 @@ static int settle_pending(Server *s)
             progress(s);
             return 0;
         }
-        /* Do not call a turn on incomplete memory. Failed nodes retry by
-         * themselves; a new message or an explicit retry starts them now. */
         error_response(req, !strcmp(op, "turn") ?
             "compaction blocked or failed; input is saved; send a message or retry" :
             "compaction blocked or failed; send a message or retry");
@@ -692,7 +667,6 @@ static int settle_pending(Server *s)
     return 0;
 }
 
-/* The host aborts its request; a late result is refused as unknown. */
 static void cancel(Server *s, Call *c)
 {
     Buf b;
@@ -732,8 +706,7 @@ static int step(Server *s)
     return settle_pending(s);
 }
 
-/* Milliseconds until the next call deadline or automatic retry; -1 (wait
- * for input) if there is none. Only these and requests change any state. */
+/* poll timeout in milliseconds; -1 waits for input without a deadline. */
 static int deadline(Server *s)
 {
     long now, left, best;
@@ -764,7 +737,6 @@ static void hello(Server *s, const Json *req)
     finish(&b);
 }
 
-/* An append's entries: the request itself, or its "records" array. */
 static Entry *entries(const Json *req, int steer, size_t *n)
 {
     const Json *list, *p;
@@ -815,7 +787,7 @@ static Call *find_call(Server *s, const Json *req)
 
 static int dispatch(Server *s, Json *req)
 {
-    const char *op, *text, *kind, *outcome;
+    const char *op, *text, *error, *outcome;
     Json *j;
     Buf b;
     Call *c;
@@ -829,7 +801,6 @@ static int dispatch(Server *s, Json *req)
     } else if (!strcmp(op, "hello")) {
         hello(s, req);
     } else if (!strcmp(op, "configure")) {
-        /* Protocol 0: the host now owns the system prompt and tools. */
         j = json_get(req, "events");
         s->ready = 1;
         s->events = j && j->type == J_BOOL && !strcmp(j->s, "true");
@@ -838,7 +809,6 @@ static int dispatch(Server *s, Json *req)
         text = json_str(json_get(req, "text"));
         if (s->pending && text && !strcmp(op, "turn") &&
             !strcmp(json_str(json_get(s->pending, "op")), "flush")) {
-            /* A turn supersedes a waiting flush: typed input is never refused. */
             error_response(s->pending, "flush superseded by a turn");
             json_free(s->pending);
             s->pending = NULL;
@@ -852,8 +822,7 @@ static int dispatch(Server *s, Json *req)
         } else {
             s->before = s->store.count;
             s->waiting = ULONG_MAX;
-            /* Record input before waiting, but retain the preceding boundary.
-             * Rendering follows live batches while opening any crossing node. */
+            /* Save input now, but render memory only up to its boundary. */
             entry.kind = "user";
             entry.text = text;
             entry.images = json_get(req, "images");
@@ -881,10 +850,10 @@ static int dispatch(Server *s, Json *req)
         } else {
             response(req, 1, NULL, NULL);
             text = json_str(json_get(req, "text"));
-            kind = json_str(json_get(req, "error"));
+            error = json_str(json_get(req, "error"));
             outcome = json_str(json_get(req, "outcome"));
-            if (kind) /* Errors win over contradictory terminal classifications. */
-                failed_job(s, c, kind);
+            if (error)
+                failed_job(s, c, error);
             else if (outcome && (!strcmp(outcome, "refused") || !strcmp(outcome, "empty"))) {
                 if (terminal_answer(s, c) < 0)
                     storage_error(s, s->pending);
@@ -942,10 +911,8 @@ static int dispatch(Server *s, Json *req)
     return s->fatal ? -1 : 0;
 }
 
-/* poll said stdin is readable, so one read cannot block. stdin stays in
- * blocking mode: a stdout sharing its file description (one socket for both
- * directions) must never turn non-blocking. At end of input, every complete
- * request already received is still dispatched. */
+/* Keep stdin blocking: stdout may share its file description through a
+ * bidirectional socket. poll makes one read safe without O_NONBLOCK. */
 static int consume(Server *s)
 {
     char bytes[65536], *nl, *record;
@@ -972,8 +939,7 @@ static int consume(Server *s)
         if (!req || req->type != J_OBJ) {
             error_response(NULL, "invalid JSON request");
             json_free(req);
-            /* An unparsed request has no trustworthy correlation id. Closing
-             * the channel rejects every waiter instead of stranding one. */
+            /* No trustworthy id: close the channel to reject all waiters. */
             return -1;
         } else if (dispatch(s, req) < 0)
             return -1;
@@ -1035,7 +1001,6 @@ static int serve(Server *s)
     return result;
 }
 
-/* The spec's prompt; C2 rewords one sentence. */
 static int print_prompt(void)
 {
     Buf b;
@@ -1099,7 +1064,6 @@ static int number(const char *text, unsigned long *n)
     return ok;
 }
 
-/* Seconds per call: 1 to 86400. */
 static int timeout_arg(const char *text, long *timeout)
 {
     unsigned long n;
@@ -1119,8 +1083,7 @@ int main(int argc, char **argv)
     unsigned long id, n, page;
     Job job;
     int k, fd, result, next, writer;
-    /* A closed standard descriptor would be reused by a chat file, and
-     * output meant for it would land in that file. */
+    /* Fill closed standard descriptors before a chat file can reuse them. */
     do
         fd = open("/dev/null", O_RDWR);
     while (fd >= 0 && fd <= STDERR_FILENO);
@@ -1133,14 +1096,11 @@ int main(int argc, char **argv)
         if (argc != 2) { usage(); return 2; }
         return print_prompt();
     }
-    /* Every argument is checked before a chat is opened: a mistyped command
-     * never creates, locks or reads one. */
+    /* Validate arguments before opening or creating a chat. */
     if (argc < 3) { usage(); return 2; }
     id = page = 0;
     n = ULONG_MAX;
     if (!strcmp(command, "serve")) {
-        /* The summary model's defaults live only here; flags override the
-         * environment. */
         s.model = env_default("UNII_MODEL", "gpt-6-luna");
         s.provider = env_default("UNII_PROVIDER", "openai-codex");
         s.effort = env_default("UNII_EFFORT", "xhigh");
@@ -1194,7 +1154,6 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    /* Only serve and add write; every other command reads without the lock. */
     writer = !strcmp(command, "serve") || !strcmp(command, "add");
     if ((writer ? store_open(&s.store, argv[2]) : store_open_read(&s.store, argv[2])) < 0) {
         fprintf(stderr, "unii: %s\n", s.store.error);
@@ -1220,8 +1179,7 @@ int main(int argc, char **argv)
         free(text);
         if (!result) {
             result = engine_open(&s.engine, &s.store);
-            /* Import never fabricates a summary or launches a paid model.
-             * Fast paths are built; model work stays queued for pi. */
+            /* Build shortcuts only; leave model work for the host. */
             while (!result && (next = engine_next(&s.engine, &job)) != 0) {
                 if (next < 0)
                     result = -1;
