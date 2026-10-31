@@ -30,18 +30,21 @@ enum { KIND_USER, KIND_UNII, KIND_TOOL, KIND_ECHO, KIND_WORK, KIND_NOTE, KINDS }
 enum { NODE_IDLE, NODE_READY, NODE_FAILED, NODE_DEFERRED }; /* Node.queued */
 
 /* Text stays on disk: an index entry names its record, which every read
- * re-validates. size is the text's length. */
+ * re-validates against its full-record fingerprint. These are live snapshots,
+ * not persisted authentication. size is the text's length. */
 typedef struct Ref { unsigned int l; unsigned long i; } Ref;
 typedef struct Message {
     off_t offset;
     unsigned long size;
     unsigned int file; /* Store.files */
     unsigned char kind, has_images;
+    unsigned char fingerprint[32];
 } Message;
 typedef struct Node {
     off_t offset;
     unsigned int file, size; /* size 0: unbuilt (a built line is never empty) */
-    unsigned char queued, busy;
+    unsigned char queued, busy, fingerprinted; /* direct slots index on first read */
+    unsigned char fingerprint[32];
 } Node;
 typedef struct View { Ref *v; size_t n, cap, bytes; int shrinking; } View;
 typedef struct Store {

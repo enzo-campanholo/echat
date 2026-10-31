@@ -133,11 +133,19 @@ export default function (pi: any) {
         key = undefined;
       },
     }).result();
+    if (signal.aborted) throw new Error("summary request aborted");
     if (reply.stopReason === "error" || reply.stopReason === "aborted")
       throw new Error(reply.errorMessage || "summary request " + reply.stopReason);
     if (reply.content.some((block: any) => block.type === "toolCall"))
       throw new Error("compaction attempted to call a tool");
-    return reply.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n");
+    /* Never infer refusal from exception/error text. Only an explicit provider
+     * refusal or an answered-empty completion permits clipped-source fallback. */
+    if (reply.stopReason === "refusal") return { outcome: "refused" };
+    if (reply.stopReason !== "stop" && reply.stopReason !== "length")
+      throw new Error("unexpected summary stop reason: " + reply.stopReason);
+    if (reply.content.some((block: any) => block.type === "refusal")) return { outcome: "refused" };
+    const text = reply.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n");
+    return text.trim() ? { outcome: "ok", text } : { outcome: "empty" };
   };
   /* Memory progress replaces the status line while a turn or flush waits. */
   const idle = () => { if (ctx?.hasUI && directory) ctx.ui.setStatus("unii", "UniiChat · " + directory); };
@@ -371,6 +379,10 @@ export default function (pi: any) {
     }
   }));
   pi.on("tool_result", (event: any) => {
+    /* Successful engine retrievals are already bounded/paginated. The page
+     * header is outside the body budget; clipping it again loses original
+     * bytes without offering another page. Keep C4's short-reference log. */
+    if (event.toolName === "zoom" && !event.isError && event.details?.log) return;
     const text = textContent(event.content);
     const clipped = clip(text);
     if (clipped === text) return;
@@ -381,7 +393,10 @@ export default function (pi: any) {
     if (event.parentToolCallId) await request("append", { kind: "tool", text: event.toolName + " " + JSON.stringify(event.args) });
   }));
   pi.on("tool_execution_end", guard(async (event: any) => {
-    if (event.parentToolCallId) await request("append", { kind: "echo", text: textContent(event.result?.content),
+    if (!event.parentToolCallId) return;
+    if (event.toolName === "zoom" && !event.isError && event.result?.details?.log)
+      await request("append", { kind: "echo", text: event.result.details.log });
+    else await request("append", { kind: "echo", text: textContent(event.result?.content),
       images: imageBlocks(event.result?.content) });
   }));
   pi.on("agent_settled", async () => {

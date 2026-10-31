@@ -25,6 +25,8 @@ void engine_close(Engine *e);
 int engine_sync(Engine *e); /* add new leaves; O(new messages), never tree scan */
 int engine_next(Engine *e, Job *j); /* 1: model job, 0: no work, -1: storage error */
 int engine_done(Engine *e, Job j, const char *text);
+/* Bounded marked source copy for terminal refusal/answered-empty only. */
+int engine_fallback(Engine *e, Job j);
 void engine_fail(Engine *e, Job j, long now);
 void engine_retry(Engine *e); /* the user's next message or an explicit retry: all failed */
 int engine_tick(Engine *e, long now); /* due automatic retries; returns how many */

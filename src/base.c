@@ -369,11 +369,39 @@ char *path_join(const char *a, const char *b)
     return out.s;
 }
 
-static int make_dir(const char *path)
+/* A name is durable only after its parent directory is synced. */
+int sync_parent(const char *path)
+{
+    char *dir, *slash;
+    int fd, result, err;
+    dir = xstrdup(path);
+    slash = dir + strlen(dir);
+    while (slash > dir + 1 && slash[-1] == '/')
+        *--slash = 0;
+    slash = strrchr(dir, '/');
+    if (slash == dir)
+        slash[1] = 0;
+    else if (slash)
+        *slash = 0;
+    fd = open(slash ? dir : ".", O_RDONLY);
+    free(dir);
+    if (fd < 0)
+        return -1;
+    result = sync_fd(fd);
+    err = errno;
+    if (close(fd) < 0 && !result) {
+        result = -1;
+        err = errno;
+    }
+    errno = err;
+    return result;
+}
+
+static int make_dir(const char *path, int intermediate)
 {
     struct stat st;
     if (!mkdir(path, 0700))
-        return 0;
+        return intermediate ? sync_parent(path) : 0;
     if (errno != EEXIST)
         return -1;
     if (stat(path, &st))
@@ -397,7 +425,7 @@ int mkdirs(const char *path)
     for (p = copy + 1; *p; p++) {
         if (*p == '/' && p[-1] != '/') {
             *p = 0;
-            if (make_dir(copy)) {
+            if (make_dir(copy, 1)) {
                 e = errno;
                 free(copy);
                 errno = e;
@@ -406,7 +434,9 @@ int mkdirs(const char *path)
             *p = '/';
         }
     }
-    e = make_dir(copy) ? errno : 0;
+    /* The caller syncs the final directory's parent as part of its own
+     * durable setup; intermediate ancestors have no later sync point. */
+    e = make_dir(copy, 0) ? errno : 0;
     free(copy);
     if (e) {
         errno = e;

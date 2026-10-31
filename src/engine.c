@@ -475,11 +475,69 @@ int engine_next(Engine *e, Job *j)
     }
 }
 
-char *engine_task(Engine *e, Job j)
+/* The exact source shared by model tasks and terminal-outcome fallback. */
+static char *source(Engine *e, Job j)
 {
     Buf b;
     char *text;
     Ref a;
+    buf_init(&b);
+    if (!j.ref.l) {
+        text = store_message(e->store, j.ref.i);
+        if (!text)
+            return NULL;
+        buf_puts(&b, store_kind(e->store, j.ref.i));
+        buf_puts(&b, ": ");
+        buf_puts(&b, text);
+        free(text);
+    } else {
+        a.l = j.ref.l - 1;
+        for (a.i = j.ref.i * 2; a.i <= j.ref.i * 2 + 1; a.i++) {
+            text = store_text(e->store, a);
+            if (!text) {
+                buf_free(&b);
+                return NULL;
+            }
+            buf_puts(&b, text);
+            buf_puts(&b, a.i & 1 ? "" : "\n");
+            free(text);
+        }
+    }
+    return b.s;
+}
+
+/* Only terminal refusal/answered-empty results may use this, never transport
+ * failures. Mark the copy and its retrieval path; keep the whole node within
+ * the ruler, flattening LF/CR exactly as the view does. */
+int engine_fallback(Engine *e, Job j)
+{
+    char *text;
+    Buf b;
+    size_t k;
+    int result;
+    text = source(e, j);
+    if (!text)
+        return -1;
+    buf_init(&b);
+    buf_puts(&b, "[clipped source; zoom(");
+    buf_ulong(&b, ref_start(j.ref));
+    buf_putc(&b, ',');
+    buf_ulong(&b, ref_span(j.ref));
+    buf_puts(&b, ")] ");
+    for (k = 0; text[k]; k++)
+        if (text[k] == '\n' || text[k] == '\r')
+            text[k] = ' ';
+    buf_add(&b, text, utf8_prefix(text, NODE_BYTES - b.len));
+    result = engine_done(e, j, b.s);
+    buf_free(&b);
+    free(text);
+    return result;
+}
+
+char *engine_task(Engine *e, Job j)
+{
+    Buf b;
+    char *text;
     size_t k;
     buf_init(&b);
     if (!j.ref.l) {
@@ -508,29 +566,13 @@ char *engine_task(Engine *e, Job j)
         buf_puts(&b, ", in more detail: take details\nof them from there too.\n");
     }
     buf_puts(&b, "<input>\n");
-    if (!j.ref.l) {
-        text = store_message(e->store, j.ref.i);
-        if (!text) {
-            buf_free(&b);
-            return NULL;
-        }
-        buf_puts(&b, store_kind(e->store, j.ref.i));
-        buf_puts(&b, ": ");
-        buf_puts(&b, text);
-        free(text);
-    } else {
-        a.l = j.ref.l - 1;
-        for (a.i = j.ref.i * 2; a.i <= j.ref.i * 2 + 1; a.i++) {
-            text = store_text(e->store, a);
-            if (!text) {
-                buf_free(&b);
-                return NULL;
-            }
-            buf_puts(&b, text);
-            buf_puts(&b, a.i & 1 ? "" : "\n");
-            free(text);
-        }
+    text = source(e, j);
+    if (!text) {
+        buf_free(&b);
+        return NULL;
     }
+    buf_puts(&b, text);
+    free(text);
     buf_puts(&b, "\n</input>");
     return b.s;
 }

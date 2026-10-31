@@ -128,8 +128,12 @@ summary is retried 15, 60 and 300 seconds later, at your next message, or on
 words already saved. Backend and persistence failures stop the turn and block
 subsequent tools. Background summary failures appear as pi notifications,
 with repeated errors reported once per turn. Authentication errors name the
-summary provider to select in `/login`. Unreadable or changed durable memory
-also stops the turn; an invalid zoom range or page is an ordinary tool error
+summary provider to select in `/login`. An answered-empty summary or explicit
+model refusal instead finishes the node with a marked, at-most-512-byte source
+excerpt (or the shortest earlier answer); originals remain available through
+`zoom`. Infrastructure, authentication, network and timeout errors never use
+this fallback. Unreadable or changed indexed memory stops the engine when that
+record is next read; an invalid zoom range or page is an ordinary tool error
 that the model can correct.
 
 ## Storage and scheduling
@@ -150,17 +154,19 @@ order in which to read while a writer runs.
 
 Every log write is one `write` and one `fsync` (`F_FULLFSYNC` on macOS, where
 plain `fsync` is not a barrier); a log's directory is synced when the file is
-created, and the writer syncs `main/`, `tree/`, the chat directory and the
-chat directory's parent (so a new chat's own entry is durable) once at open.
+created. Each directory created while opening a chat has its parent synced
+before open succeeds, including every new ancestor in a nested chat path.
+The writer also syncs `main/`, `tree/`, the chat directory and its immediate
+parent once at open. Directory-sync failures prevent acknowledgement.
 Views are replaced atomically, with files and directories synced, when
 merges change them or a batch starts or ends. Messages appended since the last
 saved view are recovered from the log as one-message lines, exactly as they
 were live; restart never rebuilds the view. A final record without its LF in
 the newest file was never acknowledged: the writer moves it to `FILE.torn`
 and continues. Any other malformed record, a missing or corrupt view, or a
-changed indexed record is an error; the program preserves the log for
-recovery from backup. Back up the whole chat directory, including the view
-and metadata. Stray temp files from an interrupted save are removed at open.
+changed indexed record, when reread, is an error; the program preserves the
+log for recovery from backup. Back up the whole chat directory, including the
+view and metadata. Stray temp files from an interrupted save are removed at open.
 
 Records go to the day file named for the newest of today's UTC date and the
 newest existing file; the record keeps the real time. So a clock step neither
@@ -170,10 +176,16 @@ Non-tool text splits at UTF-8 boundaries into consecutive messages of at most
 30,000 bytes. Echoes retain their head and tail, within a 30,000-character
 budget; multibyte echoes can span several retrieval pages. Neither message nor
 summary text is kept in memory: each index entry names its record (file,
-offset, size, kind), and every read re-validates the record. A 131,072-message
-chat opens in about 0.33 s with 10 MB of RAM. Text must be valid UTF-8 without
-NUL bytes. Invalid JSON requests close the engine's connection so callers
-cannot wait indefinitely.
+offset, size, kind and a SHA-256 fingerprint of the entire JSON record).
+Message and summary reads validate those live-index fingerprints, including
+message dates and attachment contents, so same-length edits are detected on
+reread. No log format changes or persisted trust metadata are introduced.
+Changes already made before indexing/restart cannot be authenticated or
+distinguished from original valid records; this is change detection during an
+open handle's lifetime, not cryptographic authentication. Records are checked
+lazily, not by rescanning all source messages on every summary read or turn.
+Text must be valid UTF-8 without NUL bytes. Invalid JSON requests close the
+engine's connection so callers cannot wait indefinitely.
 
 Attached images are stored with the original text in the same durable log
 record. Only the first chunk of a split message carries them. Image-bearing
@@ -243,7 +255,9 @@ Deliberate changes, each easy to find in the code:
   `zoom {"id":5,"n":1,"page":0}: message 5 page 0/1, 8123 bytes; not copied;
   zoom again to read`, without images: the tree already holds what zoom
   shows, and copying it costs log space and a summary call. Errors and `date`
-  results stay verbatim.
+  results stay verbatim. Successful engine-paginated zoom results bypass the
+  adapter's generic tool-output clip, including the header outside the page's
+  30,000-byte body budget; retrieval never silently loses a page's middle.
 - **Shell commands are logged as typed (C7):** `!ls -la`, not `ls -la`.
 - **Clock steps (A2).** The spec files records by day. A record whose day is
   earlier than the newest file goes into the newest file, keeping its real

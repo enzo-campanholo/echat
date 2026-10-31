@@ -143,7 +143,9 @@ const wellFormedStrings = (_key, value) => typeof value === "string" ? wellForme
 /* Summary calls belong to the engine that issued them. Call ids restart at 1
  * in each engine, so a call's cache gating and result must never reach a
  * later engine (after /unii restart). PERFORM(event, signal, send) does one
- * completion, gating through send, and returns its text or throws. */
+ * completion, gating through send, and returns text (legacy) or an explicit
+ * result {outcome:"ok",text}, {outcome:"empty"} or {outcome:"refused"}.
+ * Exceptions always remain retryable errors, never inferred refusals. */
 export class Calls {
   constructor(records, perform) {
     this.records = records;
@@ -157,7 +159,8 @@ export class Calls {
     this.live.set(event.call, controller);
     let outcome;
     try {
-      outcome = { text: await this.perform(event, controller.signal, data => this.records.request(data)) };
+      const result = await this.perform(event, controller.signal, data => this.records.request(data));
+      outcome = typeof result === "string" ? { text: result } : result;
     } catch (error) {
       outcome = { error: error?.message || String(error) };
     } finally {

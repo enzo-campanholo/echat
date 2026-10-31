@@ -215,9 +215,35 @@ state between calls. Up to eight calls are outstanding at once.
 `{"id":9,"op":"result","call":N,"error":"why"}` -> `{"id":9,"ok":true}`
 
 The text of the assistant's reply (text blocks joined with LF; thoughts
-excluded). A reply that called a tool should be reported as an error. A
-result for an unknown or cancelled call gets `ok:false` and is otherwise
-ignored; it is not fatal.
+excluded). `"outcome":"ok"` may accompany successful text. Legacy text-only
+results remain supported, including empty/ASCII-whitespace-only text, which
+is treated as an answered-empty completion.
+
+Terminal model outcomes may instead be reported explicitly:
+
+```
+{"id":9,"op":"result","call":N,"outcome":"empty"}
+{"id":9,"op":"result","call":N,"outcome":"refused"}
+```
+
+`empty` means a completed model answer with no non-whitespace text, not a
+missing reply. `refused` requires an explicit model/provider refusal outcome;
+never infer it from a generic exception or error-message wording. Either
+finishes a leaf or merge with the shortest earlier answer, if any, otherwise
+a marked source excerpt with a `zoom` reference, flattened and bounded to
+512 UTF-8 bytes. A source read failure is fatal, not fallback material.
+Original records are unchanged.
+
+Infrastructure/auth/network/timeout/aborted calls and replies that called a
+tool must use `error`; these remain retryable and never fabricate a summary.
+An `error` wins over any contradictory `outcome`. Unknown outcomes and missing
+text without a terminal outcome are retryable failures. A result for an
+unknown or cancelled call gets `ok:false` and is otherwise ignored; it is not
+fatal.
+
+These are additive protocol-1 fields. Older hosts still work; older engines
+ignore `outcome` and treat terminal results without text as retryable errors.
+Update the engine and host together to enable terminal fallback.
 
 ### event cancel
 
@@ -288,6 +314,15 @@ CHAT/
 - A final line without LF in the newest file is a write in progress (or, to
   the writer, an unacknowledged torn record). Anything else malformed is
   corruption.
+- While an indexed store is open, full-record SHA-256 fingerprints detect
+  changes to message and summary JSON bytes (including dates and attachments)
+  when those records are reread. Fingerprints are not persisted and do not
+  authenticate valid modifications made before indexing/restart. Reads do not
+  rescan every original underlying a summary; this is scoped live-index change
+  detection, not cryptographic authentication. The on-disk format is unchanged.
+- Writers sync the parent of every newly created directory in the chat path,
+  including newly created ancestors, before acknowledging persistent writes.
+  Directory-sync failures are errors. Read-only operations create/sync nothing.
 
 ### Reading while the engine runs
 

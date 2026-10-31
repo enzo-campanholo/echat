@@ -467,6 +467,18 @@ static void failed_job(Server *s, Call *c, const char *why)
     end_call(s, c, 0);
 }
 
+/* An answered refusal/empty reply cannot be repaired by retrying this source.
+ * Keep an earlier answer if any; otherwise record a bounded source excerpt.
+ * Infrastructure/auth/network/timeout failures never enter this path. */
+static int terminal_answer(Server *s, Call *c)
+{
+    int result;
+    result = c->shortest ? engine_done(&s->engine, c->job, c->shortest) :
+                          engine_fallback(&s->engine, c->job);
+    end_call(s, c, 1);
+    return result;
+}
+
 /* Keep the shortest of at most ATTEMPTS answers; correct in the same
  * conversation, cutting the over-long line at the limit. */
 static int answer(Server *s, Call *c, const char *line)
@@ -474,10 +486,8 @@ static int answer(Server *s, Call *c, const char *line)
     Buf correction;
     size_t length;
     int result;
-    if (!*line) {
-        failed_job(s, c, "empty summary");
-        return 0;
-    }
+    if (!line[strspn(line, " \t\r\n\f\v")])
+        return terminal_answer(s, c);
     length = strlen(line);
     if (!c->shortest || length < strlen(c->shortest)) {
         free(c->shortest);
@@ -805,7 +815,7 @@ static Call *find_call(Server *s, const Json *req)
 
 static int dispatch(Server *s, Json *req)
 {
-    const char *op, *text, *kind;
+    const char *op, *text, *kind, *outcome;
     Json *j;
     Buf b;
     Call *c;
@@ -872,10 +882,19 @@ static int dispatch(Server *s, Json *req)
             response(req, 1, NULL, NULL);
             text = json_str(json_get(req, "text"));
             kind = json_str(json_get(req, "error"));
-            if (kind || !text)
-                failed_job(s, c, kind ? kind : "call result has no text");
-            else if (answer(s, c, text) < 0)
+            outcome = json_str(json_get(req, "outcome"));
+            if (kind) /* Errors win over contradictory terminal classifications. */
+                failed_job(s, c, kind);
+            else if (outcome && (!strcmp(outcome, "refused") || !strcmp(outcome, "empty"))) {
+                if (terminal_answer(s, c) < 0)
+                    storage_error(s, s->pending);
+            } else if (outcome && strcmp(outcome, "ok")) {
+                failed_job(s, c, "unknown call result outcome");
+            } else if (!text) {
+                failed_job(s, c, "call result has no text");
+            } else if (answer(s, c, text) < 0) {
                 storage_error(s, s->pending);
+            }
         }
     } else if (!strcmp(op, "cache_wait")) {
         cache_wait(s, req);

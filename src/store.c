@@ -293,7 +293,110 @@ static int record_valid(const Json *j, unsigned long id, const char *filename)
            date_valid(json_str(json_get(j, "date")), filename);
 }
 
-static int add_message(Store *s, unsigned int file, off_t offset, const Json *j)
+/* SHA-256 of the entire original JSONL record, excluding LF. This is a
+ * live-index change detector, not persisted trust metadata or authentication.
+ * unsigned long is at least 32 bits; mask every word for wider C89 hosts. */
+static unsigned long rotate32(unsigned long x, unsigned int n)
+{
+    return ((x >> n) | (x << (32 - n))) & 0xffffffffUL;
+}
+
+static void fingerprint_block(unsigned long h[8], const unsigned char *block)
+{
+    static const unsigned long k[64] = {
+        0x428a2f98UL, 0x71374491UL, 0xb5c0fbcfUL, 0xe9b5dba5UL,
+        0x3956c25bUL, 0x59f111f1UL, 0x923f82a4UL, 0xab1c5ed5UL,
+        0xd807aa98UL, 0x12835b01UL, 0x243185beUL, 0x550c7dc3UL,
+        0x72be5d74UL, 0x80deb1feUL, 0x9bdc06a7UL, 0xc19bf174UL,
+        0xe49b69c1UL, 0xefbe4786UL, 0x0fc19dc6UL, 0x240ca1ccUL,
+        0x2de92c6fUL, 0x4a7484aaUL, 0x5cb0a9dcUL, 0x76f988daUL,
+        0x983e5152UL, 0xa831c66dUL, 0xb00327c8UL, 0xbf597fc7UL,
+        0xc6e00bf3UL, 0xd5a79147UL, 0x06ca6351UL, 0x14292967UL,
+        0x27b70a85UL, 0x2e1b2138UL, 0x4d2c6dfcUL, 0x53380d13UL,
+        0x650a7354UL, 0x766a0abbUL, 0x81c2c92eUL, 0x92722c85UL,
+        0xa2bfe8a1UL, 0xa81a664bUL, 0xc24b8b70UL, 0xc76c51a3UL,
+        0xd192e819UL, 0xd6990624UL, 0xf40e3585UL, 0x106aa070UL,
+        0x19a4c116UL, 0x1e376c08UL, 0x2748774cUL, 0x34b0bcb5UL,
+        0x391c0cb3UL, 0x4ed8aa4aUL, 0x5b9cca4fUL, 0x682e6ff3UL,
+        0x748f82eeUL, 0x78a5636fUL, 0x84c87814UL, 0x8cc70208UL,
+        0x90befffaUL, 0xa4506cebUL, 0xbef9a3f7UL, 0xc67178f2UL
+    };
+    unsigned long w[64], a, b, c, d, e, f, g, v, t1, t2, x, y;
+    unsigned int i;
+    for (i = 0; i < 16; i++)
+        w[i] = ((unsigned long)block[i * 4] << 24) |
+               ((unsigned long)block[i * 4 + 1] << 16) |
+               ((unsigned long)block[i * 4 + 2] << 8) | block[i * 4 + 3];
+    for (; i < 64; i++) {
+        x = w[i - 15];
+        y = w[i - 2];
+        w[i] = (w[i - 16] + (rotate32(x, 7) ^ rotate32(x, 18) ^ (x >> 3)) +
+                w[i - 7] + (rotate32(y, 17) ^ rotate32(y, 19) ^ (y >> 10))) & 0xffffffffUL;
+    }
+    a = h[0]; b = h[1]; c = h[2]; d = h[3];
+    e = h[4]; f = h[5]; g = h[6]; v = h[7];
+    for (i = 0; i < 64; i++) {
+        t1 = (v + (rotate32(e, 6) ^ rotate32(e, 11) ^ rotate32(e, 25)) +
+              ((e & f) ^ (~e & g)) + k[i] + w[i]) & 0xffffffffUL;
+        t2 = ((rotate32(a, 2) ^ rotate32(a, 13) ^ rotate32(a, 22)) +
+              ((a & b) ^ (a & c) ^ (b & c))) & 0xffffffffUL;
+        v = g; g = f; f = e; e = (d + t1) & 0xffffffffUL;
+        d = c; c = b; b = a; a = (t1 + t2) & 0xffffffffUL;
+    }
+    h[0] = (h[0] + a) & 0xffffffffUL; h[1] = (h[1] + b) & 0xffffffffUL;
+    h[2] = (h[2] + c) & 0xffffffffUL; h[3] = (h[3] + d) & 0xffffffffUL;
+    h[4] = (h[4] + e) & 0xffffffffUL; h[5] = (h[5] + f) & 0xffffffffUL;
+    h[6] = (h[6] + g) & 0xffffffffUL; h[7] = (h[7] + v) & 0xffffffffUL;
+}
+
+static void fingerprint(unsigned char out[32], const char *record, size_t length)
+{
+    unsigned long h[8];
+    unsigned char tail[128];
+    size_t left, n, padded;
+    unsigned int i, carry, value;
+    h[0] = 0x6a09e667UL; h[1] = 0xbb67ae85UL;
+    h[2] = 0x3c6ef372UL; h[3] = 0xa54ff53aUL;
+    h[4] = 0x510e527fUL; h[5] = 0x9b05688cUL;
+    h[6] = 0x1f83d9abUL; h[7] = 0x5be0cd19UL;
+    left = length;
+    while (left >= 64) {
+        fingerprint_block(h, (const unsigned char *)record);
+        record += 64;
+        left -= 64;
+    }
+    memset(tail, 0, sizeof(tail));
+    memcpy(tail, record, left);
+    tail[left] = 0x80;
+    padded = left < 56 ? 64 : 128;
+    /* Encode the bit length without requiring a 64-bit C integer type. */
+    n = length;
+    for (i = 0; i < 8; i++) {
+        tail[padded - 1 - i] = (unsigned char)(n % 256);
+        n /= 256;
+    }
+    carry = 0;
+    for (i = 0; i < 8; i++) {
+        value = (unsigned int)tail[padded - 1 - i] * 8 + carry;
+        tail[padded - 1 - i] = (unsigned char)(value & 255);
+        carry = value >> 8;
+    }
+    fingerprint_block(h, tail);
+    if (padded == 128)
+        fingerprint_block(h, tail + 64);
+    for (i = 0; i < 32; i++)
+        out[i] = (unsigned char)(h[i / 4] >> (24 - (i % 4) * 8));
+}
+
+static int unchanged(const unsigned char expected[32], const Buf *line)
+{
+    unsigned char actual[32];
+    fingerprint(actual, line->s, line->len);
+    return !memcmp(expected, actual, sizeof(actual));
+}
+
+static int add_message(Store *s, unsigned int file, off_t offset, const Json *j,
+                       const char *record, size_t length)
 {
     unsigned long size;
     size_t n;
@@ -310,6 +413,7 @@ static int add_message(Store *s, unsigned int file, off_t offset, const Json *j)
         s->mcap = n;
     }
     m = s->messages + s->count;
+    fingerprint(m->fingerprint, record, length);
     m->offset = offset;
     m->size = size;
     m->file = file;
@@ -320,7 +424,8 @@ static int add_message(Store *s, unsigned int file, off_t offset, const Json *j)
     return 0;
 }
 
-static int add_node(Store *s, unsigned int file, off_t offset, const Json *j)
+static int add_node(Store *s, unsigned int file, off_t offset, const Json *j,
+                    const char *record, size_t length)
 {
     unsigned long l, i, size;
     Ref r, a, b;
@@ -347,6 +452,8 @@ static int add_node(Store *s, unsigned int file, off_t offset, const Json *j)
     node = store_slot(s, r);
     if (!node)
         return -1;
+    fingerprint(node->fingerprint, record, length);
+    node->fingerprinted = 1;
     node->offset = offset;
     node->file = file;
     node->size = (unsigned int)size;
@@ -460,25 +567,6 @@ static int sync_path(const char *path)
     return result;
 }
 
-/* A new name is durable only once its directory is synced. */
-static int sync_dir(const char *path)
-{
-    char *dir, *slash;
-    int result;
-    dir = xstrdup(path);
-    slash = dir + strlen(dir);
-    while (slash > dir + 1 && slash[-1] == '/')
-        *--slash = 0; /* "chat/" names chat, not an entry inside it */
-    slash = strrchr(dir, '/');
-    if (slash == dir)
-        slash[1] = 0; /* the parent of "/chat" is "/" */
-    else if (slash)
-        *slash = 0;
-    result = sync_path(slash ? dir : ".");
-    free(dir);
-    return result;
-}
-
 /* A final record without its LF never finished its write, so its fsync never
  * returned and it was never acknowledged. The writer keeps its bytes in
  * PATH.torn (outside the *.jsonl pattern) and cuts the log back to its last
@@ -496,7 +584,7 @@ static int torn_tail(Store *s, const char *path, off_t offset, const Buf *tail)
     ok = fd >= 0 && write_all(fd, tail->s, tail->len) == 0 && sync_fd(fd) == 0;
     if (fd >= 0 && close(fd) < 0)
         ok = 0;
-    ok = ok && sync_dir(torn.s) == 0;
+    ok = ok && sync_parent(torn.s) == 0;
     if (ok) {
         fd = open(path, O_WRONLY);
         ok = fd >= 0 && ftruncate(fd, offset) == 0 && sync_fd(fd) == 0;
@@ -574,7 +662,8 @@ static int load_logs(Store *s, const char *subdir, int tree)
                 done = 1;
                 break;
             } else {
-                result = tree ? add_node(s, file, at, j) : add_message(s, file, at, j);
+                result = tree ? add_node(s, file, at, j, line.s, line.len) :
+                                add_message(s, file, at, j, line.s, line.len);
                 json_free(j);
             }
         }
@@ -622,7 +711,7 @@ int store_save_file(Store *s, const char *name, const Buf *b)
         result = -1;
         err = errno;
     }
-    if (!result && sync_dir(path) < 0) {
+    if (!result && sync_parent(path) < 0) {
         result = -1;
         err = errno;
     }
@@ -773,7 +862,7 @@ static int prepare_dir(Store *s)
     }
     if (sync_path(s->dir) < 0)
         return io_fail(s, "cannot sync chat directory", s->dir);
-    if (sync_dir(s->dir) < 0)
+    if (sync_parent(s->dir) < 0)
         return io_fail(s, "cannot sync the chat directory's parent", s->dir);
     d = opendir(s->dir);
     if (!d)
@@ -980,7 +1069,7 @@ static int append_lines(Store *s, const char *path, const Buf *b, off_t *offset)
         result = -1;
         err = errno;
     }
-    if (!result && created && sync_dir(path) < 0) {
+    if (!result && created && sync_parent(path) < 0) {
         result = -1;
         err = errno;
     }
@@ -1077,7 +1166,8 @@ int store_append(Store *s, const Entry *e, size_t n, unsigned long *first,
             lf = memchr(b.s + at, '\n', b.len - at);
             *lf = 0;
             j = json_parse(b.s + at);
-            result = add_message(s, file, offset + (off_t)at, j);
+            result = add_message(s, file, offset + (off_t)at, j, b.s + at,
+                                 (size_t)(lf - (b.s + at)));
             json_free(j);
             if (!result) {
                 Ref r;
@@ -1136,6 +1226,8 @@ int store_build(Store *s, Ref r, const char *text)
     if (!result) {
         memcpy(s->tree_day, day, sizeof(s->tree_day));
         node = store_slot(s, r);
+        fingerprint(node->fingerprint, line.s, line.len - 1);
+        node->fingerprinted = 1;
         node->offset = offset;
         node->file = store_file(s, path);
         node->size = (unsigned int)strlen(text);
@@ -1194,7 +1286,8 @@ Json *store_record(Store *s, unsigned long i)
     buf_init(&line);
     j = line_at(s, m->file, m->offset, &line) ? NULL : json_parse(line.s);
     images = json_get(j, "images");
-    if (j && !(record_valid(j, i, base_name(s->files[m->file])) &&
+    if (j && !(unchanged(m->fingerprint, &line) &&
+               record_valid(j, i, base_name(s->files[m->file])) &&
                json_ulong(json_get(j, "size"), &size) && size == m->size &&
                store_kind_id(json_str(json_get(j, "kind"))) == m->kind &&
                m->has_images == (images && images->child))) {
@@ -1268,10 +1361,18 @@ char *store_text(Store *s, Ref r)
     buf_init(&line);
     j = line_at(s, n->file, n->offset, &line) ? NULL : json_parse(line.s);
     text = json_str(json_get(j, "text"));
-    result = j && object_fields(j, 4) && json_ulong(json_get(j, "l"), &l) && l == r.l &&
+    result = j && (!n->fingerprinted || unchanged(n->fingerprint, &line)) &&
+             object_fields(j, 4) &&
+             json_ulong(json_get(j, "l"), &l) && l == r.l &&
              json_ulong(json_get(j, "i"), &i) && i == r.i && text &&
              json_ulong(json_get(j, "size"), &size) && size == n->size &&
              strlen(text) == size ? xstrdup(text) : NULL;
+    /* store_slot also permits callers to populate an index directly. Capture
+     * those records on first validated read; log load/build captures eagerly. */
+    if (result && !n->fingerprinted) {
+        fingerprint(n->fingerprint, line.s, line.len);
+        n->fingerprinted = 1;
+    }
     json_free(j);
     buf_free(&line);
     if (!result && !s->broken) {

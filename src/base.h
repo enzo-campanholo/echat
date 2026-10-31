@@ -25,6 +25,8 @@ size_t utf8_prefix(const char *s, size_t n); /* complete codepoints in first n b
 int utf8_valid(const char *s);
 char *clip_echo(const char *s, size_t chars); /* head + marker + tail: CHARS code points */
 char *path_join(const char *a, const char *b);
+int sync_parent(const char *path); /* sync the directory containing this name */
+/* Sync parents of new intermediate ancestors; caller syncs final parent. */
 int mkdirs(const char *path);
 
 /* A small strict JSON DOM. Strings are decoded; NUL in strings is rejected. */
